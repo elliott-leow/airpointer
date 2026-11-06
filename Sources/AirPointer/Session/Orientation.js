@@ -21,7 +21,10 @@ const firstStill={span:1.2,gyro:.8,accel:.03},steadyStill={span:1.8,gyro:.35,acc
 
 export class Orientation {
  // A saved offset barely moves between connections, so it is used in any pose without a wait.
- constructor(seed=null){
+ // gyroOnly is for earbuds that stream no accelerometer (AirPods 5): stillness is judged from the gyro
+ // alone, and nothing pulls the pose back toward gravity, so a slow drift is left for recentering.
+ constructor(seed=null,options={}){
+  this.gyroOnly=!!(options&&options.gyroOnly);
   const valid=a=>Array.isArray(a)&&a.length===3&&a.every(Number.isFinite);
   this.seed=seed&&valid(seed.bias)&&norm(seed.bias)<5?{bias:[...seed.bias]}:null;
   this.measured=0;this.reset();
@@ -35,22 +38,22 @@ export class Orientation {
   if(this.ready)return {seconds:span,span,progress:1,message:'Ready'};
   if(this.window.length<2)return {seconds:0,span,progress:0,message:'Set the case down'};
   const mean=key=>[0,1,2].map(i=>this.window.reduce((sum,x)=>sum+x[key][i],0)/this.window.length);
-  const bias=mean('vector'),gravity=mean('g');
+  const bias=mean('vector'),gravity=this.gyroOnly?null:mean('g');
   const spread=(key,center)=>Math.sqrt(this.window.reduce((sum,x)=>sum+norm(x[key].map((v,i)=>v-center[i]))**2,0)/this.window.length);
-  const stable=spread('vector',bias)<=firstStill.gyro&&spread('g',gravity)<=firstStill.accel;
+  const stable=spread('vector',bias)<=firstStill.gyro&&(this.gyroOnly||spread('g',gravity)<=firstStill.accel);
   const seconds=stable?Math.min(span,(this.window.at(-1).stamp-this.window[0].stamp)*1e-6):0;
   return {seconds,span,progress:seconds/span,message:stable?'Keep it still':'Movement detected — keep it still'};
  }
  // The mean of a still stretch is the gyro's resting offset; any movement starts the stretch over.
  still(stamp,vector,g,magnitude,limits){
-  if(magnitude<.85||magnitude>1.15||norm(vector)>5){this.window=[];return null;}
+  if((!this.gyroOnly&&(magnitude<.85||magnitude>1.15))||norm(vector)>5){this.window=[];return null;}
   this.window.push({stamp,vector,g});
   while(this.window.length>1&&stamp-this.window[0].stamp>(limits.span+.4)*1e6)this.window.shift();
   if(stamp-this.window[0].stamp<limits.span*1e6)return null;
   const mean=key=>[0,1,2].map(i=>this.window.reduce((s,x)=>s+x[key][i],0)/this.window.length);
-  const bias=mean('vector'),gravity=mean('g');
+  const bias=mean('vector'),gravity=this.gyroOnly?null:mean('g');
   const spread=(key,center)=>Math.sqrt(this.window.reduce((s,x)=>s+norm(x[key].map((v,i)=>v-center[i]))**2,0)/this.window.length);
-  if(spread('vector',bias)>limits.gyro||spread('g',gravity)>limits.accel)return null;
+  if(spread('vector',bias)>limits.gyro||(!this.gyroOnly&&spread('g',gravity)>limits.accel))return null;
   this.window=[];return {bias,gravity};
  }
  feed(row){
@@ -63,17 +66,17 @@ export class Orientation {
   if(previous&&dt>.2){if(this.ready&&dt<2)this.last[service]={stamp,host};else this.reset();return false;}
   this.last[service]={stamp,host};
   const vector=raw.map(x=>x*1e-5);
-  if(service===11){this.accel={vector,stamp};return false;}
-  if(!this.accel||Math.abs(stamp-this.accel.stamp)>100000)return false;
-  const g=this.accel.vector, magnitude=norm(g);
+  if(service===11){if(!this.gyroOnly)this.accel={vector,stamp};return false;}
+  if(!this.gyroOnly&&(!this.accel||Math.abs(stamp-this.accel.stamp)>100000))return false;
+  const g=this.gyroOnly?null:this.accel.vector, magnitude=this.gyroOnly?1:norm(g);
   if(!this.ready){
    // The reference pose comes from the first calm sample, so the wait is only for a first offset.
    if(this.seed&&magnitude>.95&&magnitude<1.05&&norm(vector.map((v,i)=>v-this.seed.bias[i]))<20){
-    this.bias=[...this.seed.bias];this.referenceGravity=unit(g);this.ready=true;this.seedUsed=true;this.window=[];return true;
+    this.bias=[...this.seed.bias];this.referenceGravity=this.gyroOnly?null:unit(g);this.ready=true;this.seedUsed=true;this.window=[];return true;
    }
    const still=this.still(stamp,vector,g,magnitude,firstStill);
    if(!still)return false;
-   this.bias=still.bias;this.referenceGravity=unit(still.gravity);this.seed={bias:still.bias};this.measured++;this.ready=true;
+   this.bias=still.bias;this.referenceGravity=this.gyroOnly?null:unit(still.gravity);this.seed={bias:still.bias};this.measured++;this.ready=true;
    return true;
   }
   // A steadier stretch moves the offset halfway, at most 0.1°/s, so a slow steady turn can't pass for it.
@@ -90,7 +93,7 @@ export class Orientation {
    this.q=unit(multiply(this.q,delta));
   };
   advance(omega);
-  if(magnitude>.85&&magnitude<1.15){
+  if(!this.gyroOnly&&magnitude>.85&&magnitude<1.15){
    const expected=rotate(inverse(this.q),this.referenceGravity);
    const correction=cross(unit(g),expected);
    advance(correction.map(x=>x*.5));

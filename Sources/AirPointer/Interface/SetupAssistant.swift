@@ -10,6 +10,8 @@ enum SetupLink:Equatable {case idle,openLid,connecting,closeLid,turnUpright,hold
 struct SetupTaps:Equatable {
     var heard=0
     var mixed=false,soft=false,listening=false,learned=false,failed=false
+    // AirPods 5: taps need the accelerometer, which AirPointer can't read from them yet.
+    var unavailable=false
 }
 
 struct SetupState:Equatable {
@@ -84,7 +86,7 @@ final class SetupAssistant:NSObject,NSWindowDelegate {
         if self.step==3,next != 3{onStopLearningTap?()}
         self.step=next
         // The case is already in hand, so this step just starts listening.
-        if next==3,state.connected,!state.taps.learned,!state.taps.listening{onLearnTap?()}
+        if next==3,state.connected,!state.taps.learned,!state.taps.listening,!state.taps.unavailable{onLearnTap?()}
         apply()
         guard changed else{return}
         if let responder=window.firstResponder as? NSView,responder.isHiddenOrHasHiddenAncestor{window.makeFirstResponder(nil)}
@@ -98,7 +100,7 @@ final class SetupAssistant:NSObject,NSWindowDelegate {
         // A link that drops on the tap step takes the listening with it; one that comes back picks it up.
         if step==3,old.connected != next.connected{
             if !next.connected{onStopLearningTap?()}
-            else if !next.taps.learned,!next.taps.failed,!next.taps.listening{onLearnTap?()}
+            else if !next.taps.learned,!next.taps.failed,!next.taps.listening,!next.taps.unavailable{onLearnTap?()}
         }
         guard window.isVisible else{return}
         if step==1,old.link != next.link {
@@ -246,6 +248,7 @@ final class SetupAssistant:NSObject,NSWindowDelegate {
             art=tapArt;tapArt.heard=s.taps.heard
             if !s.connected{main=("Connect Again",.reconnect);noteText=s.problem ?? "The case disconnected. Connect again, then open the lid."}
             // Teaching the tap is the last step, so once it's done the primary finishes setup.
+            else if s.taps.unavailable{main=("Finish",.finish);noteText="Tap to click needs your AirPods’ accelerometer, which AirPointer can’t read on AirPods 5 yet. Click with your trackpad or mouse for now."}
             else if s.taps.learned{checkText="Learned";main=("Finish",.finish);alt=("Tap Again",.learnTap)}
             else if s.taps.failed{main=("Try Again",.learnTap);alt=("Skip for Now",.finish);noteText="Those taps went different ways. Hold the case still and tap the same spot each time."}
             else{

@@ -12,6 +12,9 @@ struct ClosedCaseAirPods:Equatable {
     // Apple's product ID, which the lid broadcast also carries.
     var productID:UInt16=0
     var title:String{name.localizedCaseInsensitiveContains(model) ? name:"\(name) · \(model)"}
+    // Whether closedCaseLidOpen can read this model's lid broadcast. It isn't verified for AirPods 5,
+    // so Connect reaches them directly instead of waiting for a lid it may never see open.
+    var lidBroadcastKnown:Bool{productID != 0x2036}
     // Tested with AirPods Pro 3. AirPods Pro 2 share the case the pointer talks to. AirPods 5 (not Pro)
     // stream the same motion; their case is a different one, so the helper treats its keep-alive as optional.
     static let models=["0x2014":"AirPods Pro 2","0x2024":"AirPods Pro 2","0x2027":"AirPods Pro 3","0x2036":"AirPods 5"]

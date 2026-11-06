@@ -8,7 +8,7 @@ compiled="$(mktemp -d)"
 trap 'rm -rf "$compiled"' EXIT
 clang -fobjc-arc -Wall -Wextra -Werror -framework Foundation -framework CoreBluetooth -framework IOBluetooth Sources/ClosedCaseMotion/CaseSustainedRenewal.m -o "$compiled/ClosedCaseMotion.bin"
 xcrun swiftc -swift-version 5 -O Sources/ClosedCaseRestore/ClosedCaseRestore.swift -o "$compiled/ClosedCaseRestore.bin" -framework Foundation -framework CoreBluetooth -framework IOBluetooth
-xcrun swiftc -swift-version 5 "$airpointer_build_mode" Sources/AirPointer/**/*.swift -o "$compiled/AirPointer" -framework AppKit -framework JavaScriptCore -framework QuartzCore -framework ApplicationServices -framework Carbon -framework AVFoundation -framework CoreAudio -framework CoreBluetooth
+xcrun swiftc -swift-version 5 "$airpointer_build_mode" Sources/AirPointer/**/*.swift -o "$compiled/AirPointer" -framework AppKit -framework JavaScriptCore -framework QuartzCore -framework ApplicationServices -framework Carbon -framework AVFoundation -framework CoreAudio -framework CoreBluetooth -framework CoreMotion
 mkdir -p AirPointer.app/Contents/MacOS AirPointer.app/Contents/Resources
 cp Assets/CaseFront.png Assets/AppIcon.icns AirPointer.app/Contents/Resources/
 for frame in Assets/CaseLid/lid-*.png; do cp "$frame" "AirPointer.app/Contents/Resources/Case${frame:t:r:s/lid/Lid/}.png"; done
@@ -31,6 +31,7 @@ cat > AirPointer.app/Contents/Info.plist <<'PLIST'
 <key>CFBundleVersion</key><string>2</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSMotionUsageDescription</key><string>AirPointer reads your AirPods’ motion to move the pointer.</string>
 <key>NSBluetoothAlwaysUsageDescription</key><string>AirPointer connects to your paired AirPods to keep motion available with the case closed.</string>
 </dict></plist>
 PLIST

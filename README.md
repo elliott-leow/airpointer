@@ -34,7 +34,7 @@
 |---|---|
 | AirPods Pro 3, macOS 26, Apple Silicon | Tested on one Mac with one pair |
 | AirPods Pro 2 | Recognized, not tested |
-| AirPods 5 (product ID `0x2036`) | Recognized, not tested yet. See [AirPods 5](#airpods-5) |
+| AirPods 5 (product ID `0x2036`) | Points with the lid closed, from the gyroscope alone. Tap to click is off. Tested on one pair. See [AirPods 5](#airpods-5) |
 | AirPods paired with your Mac | Required |
 | Xcode | Required to build |
 
@@ -133,35 +133,56 @@ confirmed it yet.
 
 ## AirPods 5
 
-AirPods 5 have the same motion sensors as AirPods Pro, but a different case. This fork
-changes three things for them:
+AirPods 5 point with the lid closed, from their gyroscope alone. Tap to click is off for
+them for now. Tested on one pair (firmware 9A350) on one Mac.
 
-| Change | Why |
-|---|---|
-| Product ID `0x2036` counts as a supported pair | The app picks pairs by product ID, and it only knew the AirPods Pro IDs |
-| The earbud firmware's model name can be any "AirPods" name, not only "AirPods Pro" | Before this, AirPods 5 stopped with "These earbuds don’t report as AirPods Pro" |
-| With non-Pro earbuds, the case keep-alive is optional | The keep-alive was worked out on the AirPods Pro case. If the AirPods 5 case declines it, does not answer or goes quiet, the helper stops all case traffic and the session continues. With AirPods Pro, nothing changes |
+### What is different
 
-What is not known yet:
+| | AirPods Pro | AirPods 5 |
+|---|---|---|
+| Motion over AirPointer's channel | Accelerometer (service 11) and gyroscope (service 12) | Gyroscope only, on service 11. Requests for the accelerometer are acknowledged, but nothing arrives |
+| Pointing | Gyroscope, pulled toward gravity | Gyroscope alone. The offset is measured while the case is still, so a slow drift is left for **Recenter** |
+| "Turn it upright" | A quarter turn from the closed pose, by gravity | A turn of 35° or more from where the pose started |
+| Tap to click | On | Off. It is found in the accelerometer |
+| Case model name | "AirPods Charging Case" | "Charging Case" |
+| Case keep-alive | Requests renewed each second, then a held asset | Requests renewed each second. The case never offered an asset, so its stored diagnostic data was not used |
+| Lid broadcast | Connect waits for the lid to open | Connect reaches the AirPods directly, so open the lid first |
 
-- Whether the AirPods 5 case keeps the motion stream open with the lid closed when the
-  keep-alive is off. If it does not, the session ends with "Motion from your AirPods
-  stopped" soon after the lid closes.
-- Whether the 30-minute limit applies. It was measured on AirPods Pro 3.
-- The case images and the 3D model still show the AirPods Pro case. Calibration and Teach
-  Tap use the case's own motion, so they do not depend on its shape. Do the Tap step in
-  setup, because the earbuds sit in the AirPods 5 case at a different angle.
+macOS's own headphone motion (`CMHeadphoneMotionManager`) does stream the AirPods 5
+accelerometer, at about 50 Hz. It stops once AirPointer's helper holds the AirPods'
+channel, which the closed case needs, so the app does not use it. To see it with no session
+running, connect the AirPods and run:
 
-After a session, check the newest `native.log` in
-`~/Library/Application Support/AirPointer/PointerSessions/`:
+```sh
+open -W -n AirPointer.app --args --headphone-motion-probe 30
+cat ~/Library/Application\ Support/AirPointer/headphone-motion.log
+```
+
+### Still unknown
+
+- How macOS turns the accelerometer on. A PacketLogger capture of macOS's own traffic
+  while it streams headphone motion would show it. With the accelerometer, AirPods 5 would
+  get gravity correction and tap to click.
+- Whether the 30-minute limit applies. Sessions on the tested pair have run more than 9
+  minutes with the lid closed.
+
+### For developers
+
+In a session's `native.log`:
 
 | Line | Meaning |
 |---|---|
-| `ROOT MODEL name="…" pro=0` | The model name the earbuds report |
-| `CASE MODEL name="…"` | The model name the case reports, if it answered |
-| `CASE KEEPALIVE OFF … reason=…` | The case keep-alive was turned off, and why. Motion continues |
-| `EXIT code=30` | No motion came, even with the lid open |
-| `EXIT code=43` | Motion stopped. Usually the closed case cut the stream |
+| `ROOT MODEL name="airpods" pro=0` | The earbuds' firmware model name |
+| `CASE MODEL name="charging case"` | The case's firmware model name |
+| `CASE KEEPALIVE OFF … reason=…` | The case refused the keep-alive. The session goes on, and ends if motion stops |
+| `SENSOR ACK service=N status=S` | The earbuds acknowledged a sensor request |
+| `SAMPLE service=11 … report=…` | A raw sensor report, now and then |
+| `UNUSED FRAME shape=…` | The first frame of each kind the helper does not use |
+| `HID SERVICE` / `HID READY` | The earbuds listed their sensor services. Not seen yet: macOS asks first |
+
+To try other sensor requests, create `~/Library/Application Support/AirPointer/closed-case-sensor-probe`.
+Each session then asks for the services in `probeServices` (in `CaseSustainedRenewal.m`), logs what
+answers, and stops each one at the end. Delete the file to turn it off.
 
 ## Troubleshooting
 

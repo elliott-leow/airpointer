@@ -173,6 +173,9 @@ if CommandLine.arguments.contains("--check-audio-output-policy") {
     do{try runHomeChecks()}catch{fputs("Home check failed: \(error.localizedDescription)\n",stderr);exit(1)}
 } else if CommandLine.arguments.contains("--check-pointer-settings") {
     do{try runPointerSettingsChecks()}catch{fputs("Pointer settings check failed: \(error.localizedDescription)\n",stderr);exit(1)}
+} else if let index=CommandLine.arguments.firstIndex(of:"--headphone-motion-probe") {
+    let seconds=CommandLine.arguments.indices.contains(index+1) ? Double(CommandLine.arguments[index+1]) ?? 40:40
+    runHeadphoneMotionProbe(seconds:seconds)
 } else if CommandLine.arguments.contains("--self-test") {
     runAudioOutputPolicyChecks()
     let bounds = CGRect(x: -1920, y: 0, width: 1920, height: 1080)

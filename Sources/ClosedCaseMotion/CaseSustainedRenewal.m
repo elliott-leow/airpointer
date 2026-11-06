@@ -195,6 +195,39 @@ static NSArray *wireFields(NSData *data) {
     }return fields;
 }
 static uint32_t le32(const uint8_t *b) {return (uint32_t)b[0] | (uint32_t)b[1]<<8 | (uint32_t)b[2]<<16 | (uint32_t)b[3]<<24;}
+static NSString *hexPrefix(const uint8_t *b,NSUInteger count,NSUInteger limit) {
+    NSMutableString *hex=NSMutableString.string;
+    for(NSUInteger i=0;i<count && i<limit;i++) [hex appendFormat:@"%02x",b[i]];
+    if(count>limit) [hex appendString:@"…"];
+    return hex;
+}
+// A stable shape for a sensor-channel (opcode 0x17) frame: its descriptor, outer field
+// numbers, and for sensor reports (field 7) the service, report length and first byte.
+// Values that change every frame (sequence numbers, samples) are left out.
+static NSString *sensorFrameShape(uint32_t descriptor,NSData *payload) {
+    NSMutableArray *parts=[NSMutableArray arrayWithObject:[NSString stringWithFormat:@"d=0x%x",descriptor]];
+    NSUInteger index=0;
+    while(index<payload.length) {
+        uint64_t key,value;
+        if(!readVarint(payload,&index,&key) || !(key>>3)) {[parts addObject:@"?"];break;}
+        unsigned number=(unsigned)(key>>3),type=(unsigned)(key&7);
+        if(type==0) {if(!readVarint(payload,&index,&value)) {[parts addObject:@"?"];break;}[parts addObject:[NSString stringWithFormat:@"%u:v",number]];}
+        else if(type==2) {
+            if(!readVarint(payload,&index,&value) || value>payload.length-index) {[parts addObject:@"?"];break;}
+            NSData *inner=[payload subdataWithRange:NSMakeRange(index,(NSUInteger)value)];index+=(NSUInteger)value;
+            if(number==7) {
+                NSNumber *service=nil;NSData *report=nil;
+                for(NSDictionary *field in wireFields(inner)) {
+                    if([field[@"number"] unsignedIntValue]==1) service=field[@"value"];
+                    if([field[@"number"] unsignedIntValue]==3) report=field[@"bytes"];
+                }
+                [parts addObject:[NSString stringWithFormat:@"7{s=%@ len=%lu k=%d}",service?:@"-",(unsigned long)report.length,report.length?((const uint8_t *)report.bytes)[0]:-1]];
+            } else [parts addObject:[NSString stringWithFormat:@"%u:b%lu",number,(unsigned long)inner.length]];
+        } else if(type==1 || type==5) {NSUInteger n=type==1?8:4;if(n>payload.length-index) {[parts addObject:@"?"];break;}index+=n;[parts addObject:[NSString stringWithFormat:@"%u:f%lu",number,(unsigned long)n]];}
+        else {[parts addObject:@"?"];break;}
+    }
+    return [parts componentsJoinedByString:@" "];
+}
 @interface ConsoleReader : NSObject <NSStreamDelegate>
 @property(nonatomic,assign) FILE *motionStream;
 @property BOOL motionStreamFailed;
@@ -205,9 +238,54 @@ static uint32_t le32(const uint8_t *b) {return (uint32_t)b[0] | (uint32_t)b[1]<<
 @property NSString *phase;
 @property NSMutableDictionary *lastSamples;
 @property NSUInteger accelReports,gyroReports,accelFresh,gyroFresh;
+// Frames the parser doesn't use, by shape, for the session log (AirPods 5 bring-up).
+@property NSMutableDictionary<NSString *,NSNumber *> *unusedFrames;
 @end
 @implementation ConsoleReader
-- (instancetype)init { if ((self = [super init])) { self.buffer = NSMutableData.data; self.uarpMessages = NSMutableArray.array;self.earbudStateEvents=NSMutableArray.array;self.lastSamples=NSMutableDictionary.dictionary;self.phase=@"open_baseline"; } return self; }
+- (instancetype)init { if ((self = [super init])) { self.buffer = NSMutableData.data; self.uarpMessages = NSMutableArray.array;self.earbudStateEvents=NSMutableArray.array;self.lastSamples=NSMutableDictionary.dictionary;self.unusedFrames=NSMutableDictionary.dictionary;self.phase=@"open_baseline"; } return self; }
+// The first frame of each new shape goes into the log with its leading bytes; later ones are only counted.
+// The log stays in this Mac's session folder. At most 48 shapes, so a chatty channel can't fill it.
+- (void)noteUnused:(NSString *)shape bytes:(const uint8_t *)bytes count:(NSUInteger)count {
+    NSNumber *seen=self.unusedFrames[shape];
+    if(!seen && self.unusedFrames.count>=48) return;
+    self.unusedFrames[shape]=@(seen.unsignedIntegerValue+1);
+    if(!seen) printf("UNUSED FRAME uptime=%.6f shape=%s size=%lu hex=%s\n",NSProcessInfo.processInfo.systemUptime,shape.UTF8String,(unsigned long)count,hexPrefix(bytes,count,96).UTF8String);
+}
+// The earbuds' own list of HID sensor services (field 5), sent once per link after a settled
+// notifications request: an id, then an Apple property dictionary with the service's name and its
+// HID report descriptor. Logged by name and descriptor; any value after a SerialNumber key is left out.
+- (void)noteServices:(NSData *)payload {
+    for(NSDictionary *field in wireFields(payload)) {
+        unsigned number=[field[@"number"] unsignedIntValue];NSData *entry=field[@"bytes"];
+        if(number==12 && entry) for(NSDictionary *inner in wireFields(entry)) if([inner[@"number"] unsignedIntValue]==1) printf("HID READY service=%u\n",[inner[@"value"] unsignedIntValue]);
+        if(number!=5 || !entry) continue;
+        NSNumber *service=nil;NSData *properties=nil;
+        for(NSDictionary *inner in wireFields(entry)) {
+            if([inner[@"number"] unsignedIntValue]==1) service=inner[@"value"];
+            if([inner[@"number"] unsignedIntValue]==2) properties=inner[@"bytes"];
+        }
+        if(!properties) {printf("HID SERVICE id=%s no properties\n",service.stringValue.UTF8String?:"-");continue;}
+        const uint8_t *p=properties.bytes;NSUInteger n=properties.length,i=0;NSMutableArray *strings=NSMutableArray.array;BOOL skipNext=NO;
+        while(i<n) {
+            NSUInteger start=i;while(i<n && p[i]>=0x20 && p[i]<0x7f) i++;
+            if(i-start>=3) {
+                NSString *run=[[NSString alloc] initWithBytes:p+start length:i-start encoding:NSASCIIStringEncoding];
+                BOOL serialLike=run.length>=8 && [run rangeOfString:@"^[A-Z0-9]+$" options:NSRegularExpressionSearch].location!=NSNotFound;
+                if(skipNext || serialLike) [strings addObject:@"<withheld>"];else [strings addObject:run];
+                skipNext=[run containsString:@"Serial"];
+            }
+            if(i==start) i++;
+        }
+        printf("HID SERVICE id=%s size=%lu strings=%s\n",service.stringValue.UTF8String?:"-",(unsigned long)n,[strings componentsJoinedByString:@" | "].UTF8String);
+        NSRange key=[properties rangeOfData:[@"ReportDescriptor" dataUsingEncoding:NSASCIIStringEncoding] options:0 range:NSMakeRange(0,n)];
+        if(key.location!=NSNotFound) {NSUInteger at=NSMaxRange(key);printf("HID SERVICE id=%s report_descriptor_after_key=%s\n",service.stringValue.UTF8String?:"-",hexPrefix(p+at,n-at,400).UTF8String);}
+    }
+}
+- (NSString *)unusedSummary {
+    NSMutableArray *parts=NSMutableArray.array;
+    for(NSString *shape in [self.unusedFrames.allKeys sortedArrayUsingSelector:@selector(compare:)]) [parts addObject:[NSString stringWithFormat:@"[%@]x%@",shape,self.unusedFrames[shape]]];
+    return parts.count?[parts componentsJoinedByString:@" "]:@"none";
+}
 - (void)stream:(NSStream *)stream handleEvent:(NSStreamEvent)event {
     if (event == NSStreamEventErrorOccurred) {
         printf("Input stream error code=%ld\n", (long)stream.streamError.code); return;
@@ -271,6 +349,7 @@ static uint32_t le32(const uint8_t *b) {return (uint32_t)b[0] | (uint32_t)b[1]<<
                 uint32_t descriptor = b[i+6] | b[i+7]<<8 | b[i+8]<<16 | (uint32_t)b[i+9]<<24;
                 NSUInteger size = b[i+10] | b[i+11]<<8;
                 if (i + 12 + size > count) break;
+                BOOL used=NO;
                 if(descriptor==0x100000) {
                     NSData *payload=[NSData dataWithBytes:b+i+12 length:size];
                     for(NSDictionary *outer in wireFields(payload)) if([outer[@"number"] unsignedIntValue]==7 && outer[@"bytes"]) {
@@ -282,6 +361,9 @@ static uint32_t le32(const uint8_t *b) {return (uint32_t)b[0] | (uint32_t)b[1]<<
                         if(([service unsignedIntValue]==11 || [service unsignedIntValue]==12) && report.length==28) {
                             const uint8_t *r=report.bytes;uint64_t stamp=le32(r+20) | (uint64_t)le32(r+24)<<32;
                             if(r[0]==1 && stamp>0) {
+                                used=YES;
+                                NSUInteger seen=(service.unsignedIntValue==11?self.accelReports:self.gyroReports);
+                                if(seen<4 || seen%400==0) printf("SAMPLE uptime=%.6f service=%u n=%lu report=%s\n",NSProcessInfo.processInfo.systemUptime,service.unsignedIntValue,(unsigned long)seen,hexPrefix(r,28,28).UTF8String);
                                 NSDictionary *previous=self.lastSamples[service.stringValue];
                                 BOOL fresh=!previous || stamp>[previous[@"sensor_us"] unsignedLongLongValue];
                                 NSDictionary *row=@{@"sensor_us":@(stamp),@"received_uptime":@(NSProcessInfo.processInfo.systemUptime),
@@ -295,9 +377,21 @@ static uint32_t le32(const uint8_t *b) {return (uint32_t)b[0] | (uint32_t)b[1]<<
                         }
                     }
                 }
+                if(!used && descriptor==0x100000) [self noteServices:[NSData dataWithBytes:b+i+12 length:size]];
+                if(!used && descriptor==0x100000) {
+                    // A start or stop confirmation: field 2 a status, field 9 the service it was for.
+                    NSData *payload=[NSData dataWithBytes:b+i+12 length:size];NSNumber *status=nil;NSNumber *confirmed=nil;
+                    for(NSDictionary *field in wireFields(payload)) {
+                        if([field[@"number"] unsignedIntValue]==2 && field[@"value"]) status=field[@"value"];
+                        if([field[@"number"] unsignedIntValue]==9 && field[@"bytes"]) for(NSDictionary *inner in wireFields(field[@"bytes"])) if([inner[@"number"] unsignedIntValue]==1) confirmed=inner[@"value"];
+                    }
+                    if(confirmed) printf("SENSOR ACK uptime=%.6f service=%u status=%s\n",NSProcessInfo.processInfo.systemUptime,confirmed.unsignedIntValue,status?status.stringValue.UTF8String:"-");
+                }
+                if(!used) [self noteUnused:sensorFrameShape(descriptor,[NSData dataWithBytes:b+i+12 length:size]) bytes:b+i count:12+size];
                 self.controls++; self.scanned += 12 + size;
             } else {
                 if (opcode==2 || opcode==4 || opcode==6 || opcode==8 || opcode==12 || opcode==14 || opcode==43 || opcode==46 || opcode==79) self.controls++;
+                [self noteUnused:[NSString stringWithFormat:@"op=0x%x",opcode] bytes:b+i count:MIN((NSUInteger)32,count-i)];
                 self.scanned += 6;
             }
         }
@@ -412,9 +506,10 @@ static BOOL earbudModelMatches(NSString *name) {
 static BOOL earbudModelIsPro(NSString *name) {
     return earbudModelMatches(name) && [foldedModelName(name) hasPrefix:@"airpods pro"];
 }
+// The AirPods Pro case says "AirPods Charging Case"; the AirPods 5 case says only "Charging Case".
 static BOOL chargingCaseModelMatches(NSString *name) {
     NSString *folded=foldedModelName(name);
-    return [folded hasPrefix:@"airpods"] && [folded containsString:@"case"];
+    return ([folded hasPrefix:@"airpods"] && [folded containsString:@"case"]) || [folded isEqualToString:@"charging case"];
 }
 // A firmware model string for the session log, kept to one printable line.
 static NSString *loggableModelName(NSString *name) {
@@ -754,6 +849,16 @@ static NSData *sensorSetting(uint8_t service,uint32_t interval) {
     uint16_t n=message.length;uint8_t header[]={4,0,4,0,0x17,0,0,0,0x10,0,(uint8_t)n,(uint8_t)(n>>8)};
     NSMutableData *data=[NSMutableData dataWithBytes:header length:sizeof(header)];[data appendData:message];return data;
 }
+// SENSOR PROBE (bring-up only). AirPods 5 confirm the accelerometer (service 11) but not the gyro
+// (service 12). When closed-case-sensor-probe exists beside the target file, the session also asks
+// for each of these services, 0.4 s apart, and logs which ones the earbuds confirm and what they send.
+// Every probed service gets an interval-0 STOP at cleanup, and the next session's reconnect resets the link.
+// 19 is heart rate on AirPods Pro 3, so it is left out.
+static NSString *sensorProbePath=nil;
+// Round 1 (services 1-10 and 13-18 at 5 ms) got no answer from AirPods 5. Round 2 tries slower rates,
+// and head tracking at the 40 ms LibrePods uses.
+typedef struct {uint8_t service;uint32_t interval;} SensorProbe;
+static const SensorProbe probeServices[]={{12,10000},{12,20000},{10,10000},{13,10000},{12,40000},{14,40000},{16,40000},{10,40000},{13,40000}};
 static NSArray *sensorStatus(ConsoleReader *reader,double now) {
     NSMutableArray *sensors=NSMutableArray.array;
     for(NSString *key in @[@"11",@"12"]) {
@@ -836,6 +941,20 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
         if(!sensorsStarted) {exitCode=HelperExitWriteFailed;reason=@"sensor start write failed";}
     }
     if(exitCode) printf("Session setup ended: %s\n",reason.UTF8String);
+    // AirPods 5 send only one of their sensors at the Pro's settings. A notifications request repeated
+    // once the channel has settled makes the earbuds list their HID sensor services, which says how to
+    // start the rest (found by GreenPods on AirPods Pro 3). AirPods Pro sessions are unchanged.
+    const char *productText=getenv("AIRPOINTER_PRODUCT_ID");unsigned long productID=productText?strtoul(productText,NULL,0):0;
+    BOOL askServices=sensorsStarted && !exitCode && productID==0x2036,servicesAsked=NO;double servicesAskAt=NSProcessInfo.processInfo.systemUptime+.5;
+    if(askServices) printf("Product 0x%04lx: will ask the earbuds to list their sensor services\n",productID);
+    // AirPods 5 stream one sensor here (their gyro, on the Pro's accelerometer service). The app takes its
+    // motion from macOS's headphone motion for them, so this session only has to keep that one stream alive.
+    BOOL oneStream=productID==0x2036;
+    NSArray<NSString *> *liveServices=oneStream?@[@"11"]:@[@"11",@"12"];
+    if(oneStream) puts("Product 0x2036: one sensor stream keeps this session alive; the app reads motion from macOS");
+    BOOL probing=sensorsStarted && !exitCode && sensorProbePath && [NSFileManager.defaultManager fileExistsAtPath:sensorProbePath];
+    NSUInteger probeIndex=0;double nextProbeAt=NSProcessInfo.processInfo.systemUptime+1;NSMutableArray<NSNumber *> *probed=NSMutableArray.array;
+    if(probing) puts("SENSOR PROBE on: asking for services 10, 12-14 and 16 at slower rates, logging what answers");
     NSURL *phaseURL=[directory URLByAppendingPathComponent:@"phase.txt"];
     double nextStatus=0;NSUInteger publishedStates=0;BOOL publishedBaseline=NO;
     // The deadline moves on every pass, so this only ends a session if one pass stalls for about 9 s.
@@ -873,7 +992,7 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
         now=NSProcessInfo.processInfo.systemUptime;
         if(motionInputVerified) {
             BOOL fresh=YES;
-            for(NSString *service in @[@"11",@"12"]) {
+            for(NSString *service in liveServices) {
                 NSDictionary *last=reader.lastSamples[service];
                 if(!last || now-[last[@"received_uptime"] doubleValue]>3) fresh=NO;
             }
@@ -884,9 +1003,20 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
             if(!discoverySent) [transfer fail:HelperExitWriteFailed reason:@"root discovery write failed"];
         }
         [transfer tick:now];
+        if(askServices && !servicesAsked && now>=servicesAskAt) {
+            servicesAsked=YES;puts("SERVICE LIST REQUEST: notifications asked again on the settled channel");
+            if(!sendPacket(output,packet(notifications,sizeof(notifications)),"known notifications again")) {[transfer fail:HelperExitWriteFailed reason:@"notifications request write failed"];reason=transfer.error;break;}
+            nextProbeAt=MAX(nextProbeAt,now+1.5);
+        }
+        if(probing && probeIndex<sizeof(probeServices)/sizeof(probeServices[0]) && now>=nextProbeAt) {
+            SensorProbe probe=probeServices[probeIndex++];nextProbeAt=now+.5;if(![probed containsObject:@(probe.service)]) [probed addObject:@(probe.service)];
+            printf("SENSOR PROBE uptime=%.6f service=%u interval_us=%u\n",now,probe.service,probe.interval);
+            if(!sendPacket(output,sensorSetting(probe.service,probe.interval),"probe sensor start")) {[transfer fail:HelperExitWriteFailed reason:@"probe sensor start write failed"];reason=transfer.error;break;}
+        }
         {
             BOOL fresh=YES;
-            for(NSNumber *service in @[@11,@12]) {
+            for(NSString *name in liveServices) {
+                NSNumber *service=@(name.intValue);
                 NSUInteger count=service.intValue==11?reader.accelFresh:reader.gyroFresh;
                 NSDictionary *last=reader.lastSamples[service.stringValue];
                 if(count<25 || !last || now-[last[@"received_uptime"] doubleValue]>=1) fresh=NO;
@@ -906,7 +1036,7 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
                 @"sensors":sensors,@"earbud_state_events":[reader.earbudStateEvents copy],@"case_snapshot":[transfer status]};
             if(![[NSJSONSerialization dataWithJSONObject:status options:NSJSONWritingPrettyPrinted error:nil] writeToURL:[directory URLByAppendingPathComponent:@"status.json"] atomically:YES]) {[transfer fail:HelperExitCaptureWrite reason:@"status write failed"];reason=transfer.error;break;}
             NSDictionary *latest=reader.lastSamples[@"11"];
-            printf("HOLD phase=%s seconds=%.1f versions=%lu/%lu accel=%lu arrival_minus_sensor=%.3f\n",reader.phase.UTF8String,now-began,responses,queries,(unsigned long)reader.accelReports,latest?[latest[@"received_uptime"] doubleValue]-[latest[@"sensor_us"] doubleValue]*1e-6:0);nextStatus=now+1;
+            printf("HOLD phase=%s seconds=%.1f versions=%lu/%lu accel=%lu gyro=%lu arrival_minus_sensor=%.3f\n",reader.phase.UTF8String,now-began,responses,queries,(unsigned long)reader.accelReports,(unsigned long)reader.gyroReports,latest?[latest[@"received_uptime"] doubleValue]-[latest[@"sensor_us"] doubleValue]*1e-6:0);nextStatus=now+1;
         }
         if(input.streamStatus==NSStreamStatusError || input.streamStatus==NSStreamStatusAtEnd) {reason=@"input ended";exitCode=HelperExitInputEnded;break;}
         if(now-began>15 && !motionInputVerified) {[transfer fail:HelperExitBaselineUnavailable reason:@"open baseline unavailable"];reason=transfer.error;break;}
@@ -922,9 +1052,11 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
     // A signal shortens every remaining wait so the process exits within about 2 s.
     if(terminationRequested()) operationDeadline=MIN(operationDeadline>0?operationDeadline:cleanupBegan+2,MAX(cleanupBegan+.5,terminationNoticedAt+2));
     printf("Cleanup: %s; stopping sensors%s\n",reason.UTF8String,transfer.accepted?", then releasing the held case MTIC asset":"");
+    printf("UNUSED FRAMES accel=%lu gyro=%lu %s\n",(unsigned long)reader.accelReports,(unsigned long)reader.gyroReports,[reader unusedSummary].UTF8String);
     // 1. Sensor STOP, then (2) the scoped Abandon of this exact live offered
     // asset. Abandon can consume the case's staged analytics; see beginCleanup.
     BOOL accelStopped=NO,gyroStopped=NO;
+    for(NSNumber *service in probed) sendPacket(output,sensorSetting(service.unsignedCharValue,0),"probe sensor STOP");
     stopSensorsThenRelease(output,transfer,accelAttempted,gyroAttempted,&accelStopped,&gyroStopped);
     // On a channel the link already ended a STOP cannot be delivered; the
     // dropped link stays the reported cause (the log line below still shows it).
@@ -1109,7 +1241,8 @@ static void hardeningChecks(void) {
     check(chargingCaseModelMatches(@"AirPods Case") && chargingCaseModelMatches(@"AirPods 5 Charging Case"),@"a non-Pro case ModelName matches");
     check([loggableModelName(@"AirPods\n\"5\"\x01") isEqualToString:@"airpods?'5'"] && [loggableModelName(@" AirPods 5\n") isEqualToString:@"airpods 5"] && [loggableModelName(nil) isEqualToString:@"(none)"],@"logged model names stay on one printable line");
     check(chargingCaseModelMatches(@"AirPods Charging Case") && chargingCaseModelMatches(@"airpods charging case ") && chargingCaseModelMatches(@"AirPods Pro Charging Case"),@"case ModelName match ignores case and padding");
-    check(!chargingCaseModelMatches(@"AirPods Pro") && !chargingCaseModelMatches(@"Charging Case") && !chargingCaseModelMatches(nil),@"case match rejects the earbud name and non-AirPods names");
+    check(!chargingCaseModelMatches(@"AirPods Pro") && !chargingCaseModelMatches(@"Battery Case") && !chargingCaseModelMatches(@"Charging Case Pro") && !chargingCaseModelMatches(nil),@"case match rejects the earbud name and non-AirPods names");
+    check(chargingCaseModelMatches(@"Charging Case") && chargingCaseModelMatches(@" charging case\n"),@"the AirPods 5 case's plain ModelName matches");
     CaseSnapshot *root=CaseSnapshot.new;root.targetBound=YES;root.rootModelSent=YES;
     [root handleMessage:uarpMessage(4,1,testModel(@"AirPods Pro 3"))];
     check(root.rootVerified && !root.error,@"root identity accepts a later AirPods Pro ModelName");
@@ -1286,6 +1419,10 @@ static int offlineSelfTest(void) {
     fflush(sensorReader.motionStream);rewind(sensorReader.motionStream);char sampleLine[256];unsigned streamLines=0;
     while(fgets(sampleLine,sizeof(sampleLine),sensorReader.motionStream)) {streamLines++;check(strstr(sampleLine,streamLines==1?"1,11,100,":"4,11,200,")==sampleLine,@"live stream retains advancing sequence and device clock");}
     check(streamLines==2 && !sensorReader.motionStreamFailed,@"duplicate and backwards reports do not enter the live pointer stream");fclose(sensorReader.motionStream);sensorReader.motionStream=NULL;
+    ConsoleReader *shapes=ConsoleReader.new;uint8_t oddReport[46]={4,0,4,0,0x17,0,0,0,0x10,0,34,0,0x3a,32,8,12,0x1a,28,2};
+    for(int n=0;n<3;n++){NSInputStream *odd=[NSInputStream inputStreamWithData:packet(oddReport,sizeof(oddReport))];[odd open];[shapes stream:odd handleEvent:NSStreamEventHasBytesAvailable];[odd close];}
+    check(shapes.unusedFrames.count==1 && [shapes.unusedFrames[@"d=0x100000 7{s=12 len=28 k=2}"] intValue]==3 && shapes.gyroReports==0,@"a sensor report the parser can't use is logged once by shape and counted");
+    testSensorWire(shapes,500);check(shapes.unusedFrames.count==1,@"a usable sensor report is not logged as unused");
     uint8_t stateWire[]={4,0,4,0,6,0,0,2};ConsoleReader *stateObserver=ConsoleReader.new;
     NSInputStream *stateInput=[NSInputStream inputStreamWithData:packet(stateWire,8)];[stateInput open];[stateObserver stream:stateInput handleEvent:NSStreamEventHasBytesAvailable];[stateInput close];
     check(stateObserver.earbudStateEvents.count==1 && [stateObserver.earbudStateEvents[0][@"primary_code"] intValue]==0 && [stateObserver.earbudStateEvents[0][@"secondary_code"] intValue]==2 && stateObserver.buffer.length==0,@"passive earbud state notification retains only timestamp and raw primary/secondary codes");
@@ -1446,6 +1583,7 @@ int main(int argc, const char *argv[]) { @autoreleasepool {
     if(argc!=4 || strcmp(argv[2],"--pointer-session")) {puts("Usage: ClosedCaseMotion TARGET_ADDRESS_FILE --pointer-session NEW_CAPTURE_DIRECTORY");return HelperExitUsage;}
     motionOnStdout=YES;
     sensorSequencePath=[@(argv[1]).stringByDeletingLastPathComponent stringByAppendingPathComponent:@"closed-case-sensor-sequence.txt"];
+    sensorProbePath=[@(argv[1]).stringByDeletingLastPathComponent stringByAppendingPathComponent:@"closed-case-sensor-probe"];
     // A closed parent pipe must never kill the helper mid-reconnect, and a
     // termination signal runs the cleanup path instead of killing it.
     signal(SIGPIPE,SIG_IGN);

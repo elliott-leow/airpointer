@@ -51,6 +51,12 @@ func closedCaseTilt(_ a:[Double],_ b:[Double])->Double{
     let n=sqrt(aa*bb)
     return n>0 ? acos(max(-1,min(1,ab/n)))*180/Double.pi:0
 }
+// The angle in degrees between two orientation quaternions.
+func closedCaseTurned(_ q:[Double],from p:[Double])->Double{
+    guard q.count==4,p.count==4 else{return 0}
+    let d=abs(zip(q,p).map(*).reduce(0,+))
+    return 2*acos(min(1,d))*180/Double.pi
+}
 func closedCaseUpright(_ g:[Double],closed:[Double],held:[Double]?)->Bool{
     closedCaseTilt(g,closed)>=35 || held.map{closedCaseTilt(g,$0)<=30} == true
 }
@@ -136,7 +142,7 @@ func makeClosedCaseMotionContext(onError:((String)->Void)?=nil) throws -> JSCont
         context?.exception=error
         onError?(error?.toString() ?? "Motion conversion failed.")
     }
-    context.evaluateScript(source+"\nvar rawFusion=new Orientation(); var rawGrip=new Grip();")
+    context.evaluateScript(source+"\nvar fusionOptions={}; var rawFusion=new Orientation(); var rawGrip=new Grip();")
     guard context.exception==nil else{throw LessonError.message("The motion component could not load.")}
     return context
 }
@@ -154,7 +160,7 @@ final class ClosedCaseMotion {
     var gripEdges:[String:Any]?{context.evaluateScript("rawGrip.edges")?.toDictionary() as? [String:Any]}
     var gripGravity:[Double]?{(context.evaluateScript("rawGrip.gravity")?.toArray() as? [Double]).flatMap{$0.count==3 ? $0:nil}}
     var accelVector:[Double]?{(context.evaluateScript("rawFusion.accel&&rawFusion.accel.vector")?.toArray() as? [Double]).flatMap{$0.count==3 ? $0:nil}}
-    var calibrationValues:[String:Any]?{context.evaluateScript("({bias:rawFusion.bias,gravity:rawFusion.accel.vector})")?.toDictionary() as? [String:Any]}
+    var calibrationValues:[String:Any]?{context.evaluateScript("({bias:rawFusion.bias,gravity:rawFusion.accel?rawFusion.accel.vector:null})")?.toDictionary() as? [String:Any]}
     var settling:[String:Any]?{context.evaluateScript("rawFusion.settling()")?.toDictionary() as? [String:Any]}
     var lastException:String?{
         guard let error=context.exception else{return nil}
@@ -162,8 +168,10 @@ final class ClosedCaseMotion {
     }
     func loadCalibration(_ saved:[String:Any]){
         context.setObject(saved,forKeyedSubscript:"savedCalibration" as NSString)
-        context.evaluateScript("rawFusion=new Orientation(savedCalibration)")
+        context.evaluateScript("rawFusion=new Orientation(savedCalibration,fusionOptions)")
     }
+    // For earbuds with no accelerometer stream: the pose comes from the gyro alone.
+    func useGyroOnly(){context.evaluateScript("fusionOptions={gyroOnly:true};rawFusion=new Orientation(null,fusionOptions)")}
     func loadGrip(_ saved:[String:Any]){
         context.setObject(saved,forKeyedSubscript:"savedGrip" as NSString)
         context.evaluateScript("rawGrip=new Grip(savedGrip)")
@@ -437,6 +445,26 @@ func runClosedCaseNativeChecks() throws {
           abs(firstBias[0]-0.4)<0.1,abs(firstBias[1]-0.7)<0.1,abs(firstBias[2]+0.2)<0.1,firstOffset?["measured"] as? Int==1 else{
         throw LessonError.message("A saved offset must apply at once, a first one must allow a hand-held hold, and later ones must move it gently.")
     }
+    // Gyro only (AirPods 5): the offset comes from a still stretch of gyro alone, then a known turn integrates.
+    let gyroOnly=try ClosedCaseMotion.make();gyroOnly.useGyroOnly()
+    gyroOnly.context.evaluateScript("""
+    var seq=0,stamp=1000000;
+    function spin(w){stamp+=5000;rawFusion.feed([++seq,12,stamp,stamp/1e6,...w.map(x=>Math.round(x*1e5))]);}
+    var waited=rawFusion.ready;for(let i=0;i<300;i++)spin([0.8,-0.3,0.4]);
+    var settled={ready:rawFusion.ready,bias:rawFusion.bias,gravity:rawFusion.referenceGravity};
+    for(let i=0;i<200;i++)spin([0.8,-0.3,30.4]);
+    var gyroTurn=norm(rotation(rawFusion.q))*180/Math.PI;
+    """)
+    let settled=gyroOnly.context.evaluateScript("settled")?.toDictionary() as? [String:Any]
+    guard gyroOnly.context.exception==nil,gyroOnly.context.evaluateScript("waited")?.toBool()==false,settled?["ready"] as? Bool==true,
+          let gyroBias=settled?["bias"] as? [Double],abs(gyroBias[0]-0.8)<0.01,abs(gyroBias[2]-0.4)<0.01,
+          let gyroTurn=gyroOnly.context.evaluateScript("gyroTurn")?.toDouble(),abs(gyroTurn-30)<0.1,
+          gyroOnly.calibrationValues?["bias"] != nil else{
+        throw LessonError.message("Gyro-only motion must find its offset when still and integrate a known turn.")
+    }
+    guard abs(closedCaseTurned([1,0,0,0],from:[cos(.pi/8),sin(.pi/8),0,0])-45)<1e-6,closedCaseTurned([1,0,0,0],from:[-1,0,0,0])<1e-6 else{
+        throw LessonError.message("The turn between two poses must be measured in degrees, either sign.")
+    }
     let firstRun=try ClosedCaseMotion.make();let setsDown=firstRun.needsFirstOffset
     firstRun.loadCalibration(["bias":[0.1,0.1,0.1]])
     guard setsDown,!firstRun.needsFirstOffset else{throw LessonError.message("Only a case with no saved offset should be set down first.")}
@@ -472,9 +500,11 @@ final class ClosedCaseSession: NSObject {
     var tapTest:((TapOutcome)->Void)?
     // While learning, taps teach the direction instead of clicking.
     private var tapLearner:ClosedCaseTapLearner?,onTapLearning:((ClosedCaseTapLearner.Event)->Void)?
-    func learnTaps(_ handler:@escaping(ClosedCaseTapLearner.Event)->Void){tapLearner=ClosedCaseTapLearner();onTapLearning=handler}
+    func learnTaps(_ handler:@escaping(ClosedCaseTapLearner.Event)->Void){guard tapsAvailable else{return};tapLearner=ClosedCaseTapLearner();onTapLearning=handler}
     func stopLearningTaps(){tapLearner=nil;onTapLearning=nil}
     var tapDirection:[Double]?{didSet{tapDetector.direction=tapDirection.flatMap{$0.count==3 ? SIMD3($0[0],$0[1],$0[2]):nil} ?? ClosedCaseTapDetector.tapDirection}}
+    // Taps are found in the accelerometer, which AirPods 5 don't stream to AirPointer, so they don't click yet.
+    var tapsAvailable:Bool{!gyroOnly}
     var onEnded:((String?)->Void)?
     var opensLidFirst=false
     private(set) var lostContact=false
@@ -540,6 +570,13 @@ final class ClosedCaseSession: NSObject {
     private var lidWatcher:ClosedCaseLidWatcher?,lidTimeout:Timer?
     private let bluetooth=ClosedCaseBluetoothAccess()
     private var resumeAfterDrop=false
+    // The chosen pair's product ID, passed to the motion helper.
+    private var productID:UInt16=0
+    // AirPods 5 stream only their gyro, and on the service the Pro uses for its accelerometer. macOS's own
+    // headphone motion has their accelerometer, but it stops once the helper holds the AirPods' channel,
+    // which the closed case needs. So they point from the gyro alone (see Orientation's gyroOnly).
+    var gyroOnly:Bool{productID==0x2036}
+    private var closedPose:[Double]?
     var speed=1.0,clickSound=true
     var pointsWhenReady=false,usesNotch=false
     var centersItself:Bool{pointsWhenReady && centerOnly}
@@ -605,6 +642,7 @@ final class ClosedCaseSession: NSObject {
     private func fail(_ message:String){pause();feedError=message;stop()}
     private func resetFusion() throws {
         motion=try ClosedCaseMotion.make{ [weak self] error in self?.feedError=error }
+        if gyroOnly{motion?.useGyroOnly()}
         if let saved=cachedCalibration,
            let time=saved["updated_unix"] as? Double,
            (0..<7*86400).contains(Date().timeIntervalSince1970-time){
@@ -633,7 +671,7 @@ final class ClosedCaseSession: NSObject {
             try Data("closed_confirmed\n".utf8).write(to:capture.appendingPathComponent("phase.txt"),options:.atomic)
             step("lid closed");confirmed=true;ready=false
             motion?.resetGrip(keepingEdges:true);calibrated=false;smooth=CGPoint(x:0.5,y:0.5);setAim(smooth)
-            turned=false;uprightSince=nil;settle=nil
+            turned=false;uprightSince=nil;settle=nil;closedPose=nil
             closedGravity=motion?.accelVector
             heldGravity=motion?.gripGravity
             pointerFilter=ClosedCasePointerFilter()
@@ -657,11 +695,11 @@ final class ClosedCaseSession: NSObject {
                 let choice=ClosedCaseAirPods.choose(survey,saved:ClosedCaseAirPods.saved)
                 guard case .chosen(let pair)=choice else{self.finished(choice.failure ?? "");return}
                 do{try ClosedCaseAirPods.save(pair)}catch{self.finished("AirPointer couldn’t save which AirPods to use. Connect again.");return}
-                AudioOutputGuard.shared.sessionStarted(target:pair.address)
+                AudioOutputGuard.shared.sessionStarted(target:pair.address);self.productID=pair.productID
                 loadClosedCaseCalibration(from:self.calibrationURL,grip:self.gripURL,target:self.target){[weak self] hash,saved,grip in
                     guard let self,self.preparing,self.preparation==token else{return}
                     self.targetHash=hash;self.cachedCalibration=saved;self.cachedGrip=grip
-                    if pair.connected && !self.opensLidFirst{self.preparing=false;self.launch()}else{self.waitForLid(pair,token:token)}
+                    if (pair.connected && !self.opensLidFirst) || !pair.lidBroadcastKnown{self.preparing=false;self.launch()}else{self.waitForLid(pair,token:token)}
                 }
             }
         }
@@ -718,6 +756,7 @@ final class ClosedCaseSession: NSObject {
         }
         let process=Process();helper=process;process.executableURL=executable
         process.arguments=[target.path,"--pointer-session",capture.path]
+        var environment=ProcessInfo.processInfo.environment;environment["AIRPOINTER_PRODUCT_ID"]=String(format:"0x%04x",productID);process.environment=environment
         var errorPipe:Pipe?
         let motionPipe=Pipe();stream=motionPipe.fileHandleForReading
         let flags=fcntl(motionPipe.fileHandleForReading.fileDescriptor,F_GETFL)
@@ -784,7 +823,11 @@ final class ClosedCaseSession: NSObject {
               let state=(try? JSONSerialization.jsonObject(with:data)) as? [String:Any],
               let cs=state["case_snapshot"] as? [String:Any],let sensors=state["sensors"] as? [[String:Any]] else{return}
         let age=Date().timeIntervalSince1970-(state["updated_unix"] as? Double ?? 0)
-        connected=closedCaseConnectionFresh(reportAge:age,sensorAges:sensors.map{$0["age_seconds"] as? Double ?? 100},motionAge:ProcessInfo.processInfo.systemUptime-lastHost)
+        let sensorAges=sensors.map{$0["age_seconds"] as? Double ?? 100},motionAge=ProcessInfo.processInfo.systemUptime-lastHost
+        if gyroOnly{
+            let helperAge=sensorAges.first ?? 100
+            connected=age>=0 && age<2 && helperAge>=0 && helperAge+age<1 && lastHost>0 && motionAge<1
+        }else{connected=closedCaseConnectionFresh(reportAge:age,sensorAges:sensorAges,motionAge:motionAge)}
         if connected && !stopping{silentOutput?.refresh()}
         ready = !stopping && !confirmed && connected && (state["open_baseline_verified"] as? Bool == true) && 
             (cs["root_identity_verified"] as? Bool == true)
@@ -802,7 +845,7 @@ final class ClosedCaseSession: NSObject {
         changed()
     }
     private func readMotion(){
-        guard let motion else{return}
+        guard motion != nil else{return}
         let readAt=ProcessInfo.processInfo.systemUptime
         do{
             guard let stream,let fresh=try readClosedCaseMotionPipe(stream),!fresh.isEmpty else{return}
@@ -817,8 +860,15 @@ final class ClosedCaseSession: NSObject {
                 rows.append(values)
             }
             guard !rows.isEmpty else{return}
-            defer{noteRead(from:readAt)}
-            let tapEvents=tapLearner==nil && enabled && calibrated ? tapDetector.feed(rows):tapDetector.reset()
+            // AirPods 5 send their gyro on service 11; from here on it's a gyroscope row like any other.
+            handleMotion(gyroOnly ? rows.compactMap{$0[1]==11 ? [$0[0],12,$0[2],$0[3],$0[4],$0[5],$0[6]]:nil}:rows,readAt:readAt)
+        }catch{fail(error.localizedDescription)}
+    }
+    private func handleMotion(_ rows:[[Double]],readAt:Double){
+        guard let motion else{return}
+        defer{noteRead(from:readAt)}
+        do{
+            let tapEvents=tapLearner==nil && enabled && calibrated && tapsAvailable ? tapDetector.feed(rows):tapDetector.reset()
             for event in tapLearner?.feed(rows) ?? []{
                 if case .tap=event,clickSound{TapClickSound.shared.play()}
                 try? log?.write(contentsOf:Data("TAPLEARN \(event)\n".utf8))
@@ -846,13 +896,21 @@ final class ClosedCaseSession: NSObject {
             guard let result=motion.feed(rows),
                   let gyro=result["gyro"] as? [String:Any],let accel=result["accel"] as? [String:Any],
                   let host=gyro["host"] as? Double,let stamp=gyro["stamp"] as? Double,
-                  let accelHost=accel["host"] as? Double else{return}
+                  let accelHost=gyroOnly ? host:accel["host"] as? Double else{return}
             let nextGeneration=result["generation"] as? Int ?? 0
             if let measured=result["measured"] as? Int,measured>savedMeasure,
                savedMeasure==0 || ProcessInfo.processInfo.systemUptime-lastCalibrationSave>30{saveCalibration()}
             // The turn counts from where the case was set down. A table can match the saved grip's tilt,
             // so that shortcut is off and the case has to really move.
-            if motion.needsFirstOffset{closedGravity=nil;heldGravity=nil;uprightSince=nil}
+            if motion.needsFirstOffset{closedGravity=nil;heldGravity=nil;uprightSince=nil;closedPose=nil}
+            else if gyroOnly,confirmed,!turned,result["ready"] as? Bool==true,let q=result["q"] as? [Double],q.count==4 {
+                // No gravity to measure a quarter turn by, so it's a turn of 35° or more from where the pose started.
+                if closedPose==nil{closedPose=q}
+                if let closedPose,closedCaseTurned(q,from:closedPose)>=35{
+                    if uprightSince==nil{uprightSince=stamp}
+                    if let uprightSince,stamp-uprightSince>=250000{turned=true}
+                }else{uprightSince=nil}
+            }
             else if confirmed,!turned,let g=result["g"] as? [Double],g.count==3 {
                 if closedGravity==nil{closedGravity=g}
                 if let closedGravity,closedCaseUpright(g,closed:closedGravity,held:heldGravity){
@@ -887,7 +945,7 @@ final class ClosedCaseSession: NSObject {
             }
             setAim(smooth);onPoint?(smooth)
             if enabled && ProcessInfo.processInfo.systemUptime-host<0.25{postCursor()}
-        }catch{fail(error.localizedDescription)}
+        }
     }
     // How long a read of motion holds up the main run loop, for the session log.
     private func noteRead(from start:Double){

@@ -230,6 +230,7 @@ extension App {
     @objc func runSetupAgain(){pause();showSetup();setup?.go(to:AXIsProcessTrusted() ? 1:0)}
     func teachTap(){pause();showSetup();setupTaps=SetupTaps();refreshSetup();setup?.go(to:3)}
     private func learnTap(){
+        if closedCaseSession?.tapsAvailable==false{setupTaps=SetupTaps(unavailable:true);refreshSetup();return}
         setupTaps=SetupTaps(listening:true)
         closedCaseSession?.learnTaps{ [weak self] event in
             guard let self else{return}
