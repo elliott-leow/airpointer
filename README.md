@@ -10,6 +10,10 @@
 </p>
 
 <p align="center">
+  <em>This fork of <a href="https://github.com/musubipapi/airpointer">musubipapi/airpointer</a> adds AirPods 5 (not Pro). See <a href="#airpods-5">AirPods 5</a>.</em>
+</p>
+
+<p align="center">
   <img src="Assets/Readme/connect.gif" width="100%" alt="The connect steps: open the lid, close the lid, turn the case upright, and point">
 </p>
 
@@ -30,6 +34,7 @@
 |---|---|
 | AirPods Pro 3, macOS 26, Apple Silicon | Tested on one Mac with one pair |
 | AirPods Pro 2 | Recognized, not tested |
+| AirPods 5 (product ID `0x2036`) | Recognized, not tested yet. See [AirPods 5](#airpods-5) |
 | AirPods paired with your Mac | Required |
 | Xcode | Required to build |
 
@@ -126,6 +131,38 @@ Measured sessions ended at the same time, about 1,805 seconds after the lid clos
 This comes from reading the firmware and from those timings. No live capture has
 confirmed it yet.
 
+## AirPods 5
+
+AirPods 5 have the same motion sensors as AirPods Pro, but a different case. This fork
+changes three things for them:
+
+| Change | Why |
+|---|---|
+| Product ID `0x2036` counts as a supported pair | The app picks pairs by product ID, and it only knew the AirPods Pro IDs |
+| The earbud firmware's model name can be any "AirPods" name, not only "AirPods Pro" | Before this, AirPods 5 stopped with "These earbuds don’t report as AirPods Pro" |
+| With non-Pro earbuds, the case keep-alive is optional | The keep-alive was worked out on the AirPods Pro case. If the AirPods 5 case declines it, does not answer or goes quiet, the helper stops all case traffic and the session continues. With AirPods Pro, nothing changes |
+
+What is not known yet:
+
+- Whether the AirPods 5 case keeps the motion stream open with the lid closed when the
+  keep-alive is off. If it does not, the session ends with "Motion from your AirPods
+  stopped" soon after the lid closes.
+- Whether the 30-minute limit applies. It was measured on AirPods Pro 3.
+- The case images and the 3D model still show the AirPods Pro case. Calibration and Teach
+  Tap use the case's own motion, so they do not depend on its shape. Do the Tap step in
+  setup, because the earbuds sit in the AirPods 5 case at a different angle.
+
+After a session, check the newest `native.log` in
+`~/Library/Application Support/AirPointer/PointerSessions/`:
+
+| Line | Meaning |
+|---|---|
+| `ROOT MODEL name="…" pro=0` | The model name the earbuds report |
+| `CASE MODEL name="…"` | The model name the case reports, if it answered |
+| `CASE KEEPALIVE OFF … reason=…` | The case keep-alive was turned off, and why. Motion continues |
+| `EXIT code=30` | No motion came, even with the lid open |
+| `EXIT code=43` | Motion stopped. Usually the closed case cut the stream |
+
 ## Troubleshooting
 
 | Problem | What to do |
@@ -141,7 +178,7 @@ confirmed it yet.
 
 ```mermaid
 flowchart LR
-    subgraph AirPods["AirPods Pro in the closed case"]
+    subgraph AirPods["AirPods in the closed case"]
         Sensors["Motion sensors"]
     end
 

@@ -288,7 +288,9 @@ func runClosedCaseNativeChecks() throws {
     guard closedCaseLidOpen(frame(0x24,0x11),productID:0x2027)==true,closedCaseLidOpen(frame(0x62,0x32),productID:0x2027)==true,
           closedCaseLidOpen(frame(0x24,0x19),productID:0x2027)==false,closedCaseLidOpen(frame(0x02,0x11),productID:0x2027)==nil,
           closedCaseLidOpen(frame(0x24,0x11,model:[0x14,0x20]),productID:0x2027)==nil,closedCaseLidOpen(frame(0x24,0x11,model:[0x14,0x20]),productID:0x2014)==true,
-          closedCaseLidOpen(frame(0x24,0x11,length:27),productID:0x2027)==nil else{
+          closedCaseLidOpen(frame(0x24,0x11,length:27),productID:0x2027)==nil,
+          closedCaseLidOpen(frame(0x24,0x11,model:[0x36,0x20]),productID:0x2036)==true,closedCaseLidOpen(frame(0x24,0x19,model:[0x36,0x20]),productID:0x2036)==false,
+          closedCaseLidOpen(frame(0x24,0x11,model:[0x36,0x20]),productID:0x2027)==nil else{
         throw LessonError.message("The lid broadcast must be read only for this model with an earbud in the case.")
     }
     func lid(_ timeline:[(Double,Int,Int)])->Bool{closedCaseLidClosed(timeline.map{(uptime:$0.0,primary:$0.1,secondary:$0.2)})}
@@ -308,10 +310,11 @@ func runClosedCaseNativeChecks() throws {
                             ["Test AirPods Pro":["device_address":"0A:1B:2C:3D:4E:60"]],
                             ["Keyboard":["device_vendorID":"0x3434","device_productID":"0x2027","device_address":"0A:1B:2C:3D:4E:61"]]],
         "device_not_connected":[["Spare AirPods Pro":["device_vendorID":"0x004C","device_productID":"0x2024","device_address":"0A:1B:2C:3D:4E:62"]],
-                                ["AirPods":["device_vendorID":"0x004C","device_productID":"0x2002","device_address":"0A:1B:2C:3D:4E:63"]]]]]]
+                                ["AirPods":["device_vendorID":"0x004C","device_productID":"0x2002","device_address":"0A:1B:2C:3D:4E:63"]],
+                                ["Test’s AirPods #2":["device_vendorID":"0x004C","device_productID":"0x2036","device_address":"0A:1B:2C:3D:4E:64"]]]]]]
     guard let survey=ClosedCaseAirPods.parse(try JSONSerialization.data(withJSONObject:listing)),survey.poweredOn,
-          survey.pairs.map(\.address)==["0A:1B:2C:3D:4E:5F","0A:1B:2C:3D:4E:62"],survey.pairs.map(\.connected)==[true,false],
-          survey.pairs[1].title=="Spare AirPods Pro · AirPods Pro 2" else{
+          survey.pairs.map(\.address)==["0A:1B:2C:3D:4E:5F","0A:1B:2C:3D:4E:62","0A:1B:2C:3D:4E:64"],survey.pairs.map(\.connected)==[true,false,false],
+          survey.pairs[1].title=="Spare AirPods Pro · AirPods Pro 2",survey.pairs[2].title=="Test’s AirPods #2 · AirPods 5",survey.pairs[2].productID==0x2036 else{
         throw LessonError.message("Paired AirPods must be found by vendor and product ID, not by name.")
     }
     let bothConnected=ClosedCaseAirPods.Survey(poweredOn:true,pairs:survey.pairs.map{ClosedCaseAirPods(name:$0.name,model:$0.model,address:$0.address,connected:true,productID:$0.productID)})

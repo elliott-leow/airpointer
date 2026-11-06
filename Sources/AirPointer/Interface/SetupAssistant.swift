@@ -224,7 +224,7 @@ final class SetupAssistant:NSObject,NSWindowDelegate {
             case .idle:
                 caseArt.step = .closed;main=("Connect",.connect);var problem=s.problem
                 // Setup has no Settings to send them to, so the choice comes from here.
-                if s.problem==ClosedCaseAirPods.Choice.several.failure{main=("Choose AirPods…",.chooseAirPods);problem="More than one pair of AirPods Pro is paired with this Mac. Choose which to use."}
+                if s.problem==ClosedCaseAirPods.Choice.several.failure{main=("Choose AirPods…",.chooseAirPods);problem="More than one pair of AirPods is paired with this Mac. Choose which to use."}
                 // A problem doesn't replace the effects: the person hasn't connected yet.
                 noteText=[problem,Self.connectEffects].compactMap{$0}.joined(separator:"\n\n")
             case .openLid:caseArt.step = .opening;chipText="Waiting for the lid";main=("Connecting…",.none)

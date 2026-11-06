@@ -27,10 +27,12 @@
 //   30 BASELINE_UNAVAILABLE No fresh accelerometer+gyro within 15 s with the lid open. AirPods also
 //                           connected to an iPhone do this: setup answered, then no motion or UARP.
 //   31 IDENTITY_UNAVAILABLE The earbud never confirmed its identity (root Model/VERSION).
-//   32 WRONG_EARBUD_MODEL   The earbud's firmware ModelName is not AirPods Pro.
+//   32 WRONG_EARBUD_MODEL   The earbud's firmware ModelName is not AirPods (Pro or not).
 //   34 WRONG_CASE_MODEL     Endpoint 1's firmware ModelName is not an AirPods charging case.
 //   35 CASE_LOST            The case endpoint announced itself unreachable.
 //   36 CASE_DECLINED        The case refused or rejected the diagnostic (MTIC) request.
+//                           With non-Pro earbuds (AirPods 5) 34-36 and the case's own reply
+//                           problems only switch the case keep-alive off; see caseFailed.
 //   40 REPLY_TIMEOUT        An expected earbud or case reply did not arrive in time.
 //   41 UNEXPECTED_REPLY     A malformed, replayed or out-of-order reply; stopped for safety.
 //   42 WRITE_FAILED         A write to the AirPods failed, or its request budget was exhausted.
@@ -88,7 +90,7 @@ static const HelperExitInfo helperExitTable[]={
     {HelperExitNoSessionReply,"NO_SESSION_REPLY","AACP channel opened but nothing answered"},
     {HelperExitBaselineUnavailable,"BASELINE_UNAVAILABLE","no fresh open-lid motion"},
     {HelperExitIdentityUnavailable,"IDENTITY_UNAVAILABLE","earbud identity not confirmed"},
-    {HelperExitWrongEarbudModel,"WRONG_EARBUD_MODEL","earbud ModelName is not AirPods Pro"},
+    {HelperExitWrongEarbudModel,"WRONG_EARBUD_MODEL","earbud ModelName is not AirPods"},
     {HelperExitWrongCaseModel,"WRONG_CASE_MODEL","endpoint is not an AirPods charging case"},
     {HelperExitCaseLost,"CASE_LOST","charging case became unreachable"},
     {HelperExitCaseDeclined,"CASE_DECLINED","case declined the diagnostic request"},
@@ -396,18 +398,31 @@ static RootVersionAction steadyRootVersionAction(BOOL versionValid,BOOL pending,
 // They are model strings, not the user-editable Bluetooth device name, so a
 // renamed pair still matches. Compare tolerantly: trim, ignore case, and accept
 // later model suffixes such as "AirPods Pro 3", while still telling the earbud
-// and the case apart.
+// and the case apart. Non-Pro earbuds (AirPods 5) are accepted too; their exact
+// strings are not known yet, so the helper logs both names it is given.
 static NSString *foldedModelName(NSString *name) {
     NSMutableCharacterSet *trim=NSMutableCharacterSet.whitespaceAndNewlineCharacterSet;[trim formUnionWithCharacterSet:NSCharacterSet.controlCharacterSet];
     return [[name stringByTrimmingCharactersInSet:trim] lowercaseString];
 }
 static BOOL earbudModelMatches(NSString *name) {
     NSString *folded=foldedModelName(name);
-    return [folded hasPrefix:@"airpods pro"] && ![folded containsString:@"case"];
+    return [folded hasPrefix:@"airpods"] && ![folded containsString:@"case"];
+}
+// Only AirPods Pro earbuds sit in the case whose keep-alive below was verified.
+static BOOL earbudModelIsPro(NSString *name) {
+    return earbudModelMatches(name) && [foldedModelName(name) hasPrefix:@"airpods pro"];
 }
 static BOOL chargingCaseModelMatches(NSString *name) {
     NSString *folded=foldedModelName(name);
-    return [folded hasPrefix:@"airpods"] && [folded containsString:@"charging case"];
+    return [folded hasPrefix:@"airpods"] && [folded containsString:@"case"];
+}
+// A firmware model string for the session log, kept to one printable line.
+static NSString *loggableModelName(NSString *name) {
+    NSString *folded=[foldedModelName(name) stringByReplacingOccurrencesOfString:@"\"" withString:@"'"];
+    if(!folded) return @"(none)";
+    NSMutableString *line=NSMutableString.string;
+    for(NSUInteger i=0;i<folded.length && i<64;i++) {unichar c=[folded characterAtIndex:i];if(c<0x20 || c==0x7f) c='?';[line appendString:[NSString stringWithCharacters:&c length:1]];}
+    return line;
 }
 // The ordinary link is reopened with a few spaced attempts: a single failed
 // openConnection used to exit and leave a link this helper closed still down.
@@ -449,6 +464,10 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
 @property BOOL accepted,receiptAttempted,cleanupStarted,cleanupSent,cleanupWriteComplete,cleanupAck;
 @property NSUInteger startupUnknownBytes,modelSentAfterVersionFrames;
 @property BOOL solicitationAttempted,solicitationSent,solicitationReceiptVerified,denialReceiptAttempted;
+// caseOptional: the earbuds are not AirPods Pro, so the case keep-alive is best effort.
+// caseSkipped: it was switched off; nothing more is sent to the case.
+@property BOOL caseOptional,caseSkipped;
+@property NSString *caseSkipReason;
 @property NSUInteger solicitationAttempts,solicitationReceipts;
 @property double lastSolicitationAt;
 @property NSString *rootIdentity,*caseIdentity,*error,*pending;
@@ -470,6 +489,17 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
 - (void)fail:(int)code reason:(NSString *)reason {
     if(self.error) return;
     self.error=reason;self.failure=code;
+}
+// The keep-alive below was worked out on the AirPods Pro case. A non-Pro case (AirPods 5)
+// may answer differently or not at all. Until an asset is held there is nothing on the case
+// to release, so for those earbuds a case-side problem only stops all case traffic: the
+// session keeps streaming, and MOTION_STALE ends it if the closed case stops the stream.
+// With AirPods Pro, or once an asset is held, it ends the session as before.
+- (void)caseFailed:(int)code reason:(NSString *)reason {
+    if(!self.caseOptional || self.accepted || self.receiptAttempted || self.cleanupStarted || self.error) {[self fail:code reason:reason];return;}
+    if(self.caseSkipped) return;
+    self.caseSkipped=YES;self.caseSkipReason=reason;self.pending=nil;
+    printf("CASE KEEPALIVE OFF uptime=%.6f code=%d reason=%s; motion decides\n",NSProcessInfo.processInfo.systemUptime,code,reason.UTF8String);
 }
 - (BOOL)maySolicitAt:(double)now {
     if(!self.solicitationAttempted) return YES;
@@ -498,6 +528,7 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     if(![self canSendRoot:type body:body]) return NO;uint16_t identifier=self.nextTXID;self.nextTXID=nextIdentifier(identifier);return sendUARPPacket(self.output,type,identifier,body);
 }
 - (BOOL)canSendChild:(uint16_t)type body:(NSData *)body {
+    if(self.caseSkipped) return NO;
     NSUInteger bytes=body.length+6;const uint8_t *b=body.bytes;
     double now=NSProcessInfo.processInfo.systemUptime;
     if(!self.budgetStartedAt || now-self.budgetStartedAt>=60){self.budgetStartedAt=now;self.windowRequests=0;self.windowBytes=0;}
@@ -547,7 +578,7 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
         if(n!=2) {[self fail:HelperExitUnexpectedReply reason:@"malformed endpoint announcement"];return;}
         uint16_t endpoint=be16(b+6);if(type==0x17) [self.announced addObject:@(endpoint)];
         if([self.announced containsObject:@(endpoint)]) {uint8_t ack[]={0,0,endpoint>>8,endpoint};if(![self sendRoot:type==0x17?0x18:0x1a body:packet(ack,4)]) [self fail:HelperExitWriteFailed reason:@"endpoint receipt ACK write failed"];}
-        if(endpoint==1) {self.caseActive=type==0x17;if(!self.caseActive) [self fail:HelperExitCaseLost reason:@"announced case became unreachable"];}
+        if(endpoint==1) {self.caseActive=type==0x17;if(!self.caseActive) [self caseFailed:HelperExitCaseLost reason:@"announced case became unreachable"];}
         return;
     }
     if(type==2) {
@@ -558,39 +589,41 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     }
     if(type==4 && self.rootModelSent && !self.rootVerified) {
         self.rootIdentity=modelName([message subdataWithRange:NSMakeRange(6,n)])?:@"Invalid model response";
-        if(!earbudModelMatches(self.rootIdentity)) {[self fail:HelperExitWrongEarbudModel reason:@"exact root earbud model check failed"];return;}self.rootVerified=YES;return;
+        printf("ROOT MODEL name=\"%s\" pro=%d\n",loggableModelName(self.rootIdentity).UTF8String,earbudModelIsPro(self.rootIdentity));
+        if(!earbudModelMatches(self.rootIdentity)) {[self fail:HelperExitWrongEarbudModel reason:@"exact root earbud model check failed"];return;}
+        self.caseOptional=!earbudModelIsPro(self.rootIdentity);self.rootVerified=YES;return;
     }
     if(type!=0x1b) return;if(n<8) {[self fail:HelperExitUnexpectedReply reason:@"short downstream envelope"];return;}if(be16(b+6)!=1) return;
-    if(!self.caseActive || ![self.announced containsObject:@1]) return;
+    if(!self.caseActive || ![self.announced containsObject:@1] || self.caseSkipped) return;
     const uint8_t *inner=b+8;uint16_t it=be16(inner),in=be16(inner+2),identifier=be16(inner+4);
-    if((NSUInteger)n!=(NSUInteger)in+8) {[self fail:HelperExitUnexpectedReply reason:@"malformed case inner frame"];return;}
+    if((NSUInteger)n!=(NSUInteger)in+8) {[self caseFailed:HelperExitUnexpectedReply reason:@"malformed case inner frame"];return;}
     NSData *body=[NSData dataWithBytes:inner+6 length:in];const uint8_t *v=body.bytes;
     if(it==5) {
         if(in<4 || memcmp(v,"MTIC",4)) return;
-        NSDictionary *meta=mticOffer(body);if(!meta) {[self fail:HelperExitUnexpectedReply reason:@"invalid or oversized case MTIC offer"];return;}
+        NSDictionary *meta=mticOffer(body);if(!meta) {[self caseFailed:HelperExitUnexpectedReply reason:@"invalid or oversized case MTIC offer"];return;}
         if(!self.offer && !self.cleanupStarted && !self.error) {self.offer=body;self.offerMetadata=meta;}
         return;
     }
     if(it!=2 && it!=4 && it!=7 && it!=0x0f && it!=0x12 && it!=0x13) return;
-    if([self.caseResponseIDs containsObject:@(identifier)]) {[self fail:HelperExitUnexpectedReply reason:@"replayed case response ID"];return;}
+    if([self.caseResponseIDs containsObject:@(identifier)]) {[self caseFailed:HelperExitUnexpectedReply reason:@"replayed case response ID"];return;}
     [self.caseResponseIDs addObject:@(identifier)];
     [self.recentCaseIDs addObject:@(identifier)];
     if(self.recentCaseIDs.count>128){[self.caseResponseIDs removeObject:self.recentCaseIDs.firstObject];[self.recentCaseIDs removeObjectAtIndex:0];}
     if(it==0x0f && self.cleanupSent) {
-        if(in!=4 || be16(v)!=self.assetID || be16(v+2)!=3) {[self fail:HelperExitUnexpectedReply reason:@"invalid scoped cleanup acknowledgement"];return;}
+        if(in!=4 || be16(v)!=self.assetID || be16(v+2)!=3) {[self caseFailed:HelperExitUnexpectedReply reason:@"invalid scoped cleanup acknowledgement"];return;}
         self.cleanupAck=YES;self.pending=nil;self.unconfirmedBytes=self.startupUnknownBytes;return;
     }
     if(self.cleanupStarted) return;
     if(it==0x12 && self.solicitationSent && [self.pending isEqualToString:@"solicit"]) {
-        if(in!=8 || be32(v)!=0 || memcmp(v+4,"MTIC",4)) {[self fail:(in==8 && !memcmp(v+4,"MTIC",4))?HelperExitCaseDeclined:HelperExitUnexpectedReply reason:@"case diagnostic request receipt was invalid or unsuccessful"];return;}
+        if(in!=8 || be32(v)!=0 || memcmp(v+4,"MTIC",4)) {[self caseFailed:(in==8 && !memcmp(v+4,"MTIC",4))?HelperExitCaseDeclined:HelperExitUnexpectedReply reason:@"case diagnostic request receipt was invalid or unsuccessful"];return;}
         self.solicitationReceiptVerified=YES;self.solicitationReceipts++;self.pending=nil;self.unconfirmedBytes=self.startupUnknownBytes;
     } else if(it==0x13 && self.solicitationSent && !self.accepted) {
-        if(in!=6 || memcmp(v,"MTIC",4)) {[self fail:HelperExitUnexpectedReply reason:@"invalid case diagnostic rejection"];return;}
+        if(in!=6 || memcmp(v,"MTIC",4)) {[self caseFailed:HelperExitUnexpectedReply reason:@"invalid case diagnostic rejection"];return;}
         self.solicitationDenial=body;
         BOOL acknowledged=[self sendChild:0x14 body:body];
-        [self fail:HelperExitCaseDeclined reason:acknowledged?[NSString stringWithFormat:@"case diagnostic request declined (reason %u)",be16(v+4)]:@"case diagnostic rejection receipt could not be sent"];
+        [self caseFailed:HelperExitCaseDeclined reason:acknowledged?[NSString stringWithFormat:@"case diagnostic request declined (reason %u)",be16(v+4)]:@"case diagnostic rejection receipt could not be sent"];
     } else if(it==2 && self.caseVersionReplies<self.caseVersionFrames) {
-        if(in<4 || be16(v)!=0 || be16(v+2)<5 || be16(v+2)>7) {[self fail:HelperExitUnexpectedReply reason:@"invalid case VERSION response"];return;}
+        if(in<4 || be16(v)!=0 || be16(v+2)<5 || be16(v+2)>7) {[self caseFailed:HelperExitUnexpectedReply reason:@"invalid case VERSION response"];return;}
         self.caseVersionValid=YES;self.caseVersionReplies++;self.unconfirmedBytes=self.unconfirmedBytes>=8?self.unconfirmedBytes-8:0;
         if(self.startupUnknownBytes) self.startupUnknownBytes-=MIN((NSUInteger)8,self.startupUnknownBytes);
         if(self.caseVersionReplies==self.caseVersionFrames) {
@@ -599,23 +632,24 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
             if(self.caseModelVerified) self.caseRouteDrained=YES;
         }
     } else if(it==4 && self.caseModelSent && !self.caseModelVerified) {
-        if((![self.pending isEqual:@"model"] || self.modelSentAfterVersionFrames!=self.caseVersionFrames)) {[self fail:HelperExitUnexpectedReply reason:@"case identity reply did not match the ordered setup query"];return;}
+        if((![self.pending isEqual:@"model"] || self.modelSentAfterVersionFrames!=self.caseVersionFrames)) {[self caseFailed:HelperExitUnexpectedReply reason:@"case identity reply did not match the ordered setup query"];return;}
         self.caseIdentity=modelName(body);
-        if(!chargingCaseModelMatches(self.caseIdentity)) {[self fail:HelperExitWrongCaseModel reason:@"announced endpoint is not the exact case model"];return;}
+        printf("CASE MODEL name=\"%s\"\n",loggableModelName(self.caseIdentity).UTF8String);
+        if(!chargingCaseModelMatches(self.caseIdentity)) {[self caseFailed:HelperExitWrongCaseModel reason:@"announced endpoint is not the exact case model"];return;}
         self.caseModelVerified=YES;self.pending=nil;self.unconfirmedBytes=self.unconfirmedBytes>=10?self.unconfirmedBytes-10:0;
         self.caseRouteDrained=self.caseVersionReplies==self.caseVersionFrames;
         if(self.caseRouteDrained) self.unconfirmedBytes=0;
         else {
             self.startupUnknownBytes=(self.caseVersionFrames-self.caseVersionReplies)*8;
-            if(self.startupUnknownBytes!=8 || self.unconfirmedBytes!=8) [self fail:HelperExitReplyTimeout reason:@"more than one startup VERSION remained unanswered"];
+            if(self.startupUnknownBytes!=8 || self.unconfirmedBytes!=8) [self caseFailed:HelperExitReplyTimeout reason:@"more than one startup VERSION remained unanswered"];
         }
     } else if(it==4 && self.caseModelVerified && [self.pending isEqualToString:@"identity_refresh"]) {
         NSString *refreshed=modelName(body);
-        if(!chargingCaseModelMatches(refreshed) || (self.caseIdentity.length && ![foldedModelName(refreshed) isEqualToString:foldedModelName(self.caseIdentity)])) {[self fail:HelperExitWrongCaseModel reason:@"case identity refresh did not match the identified case"];return;}
+        if(!chargingCaseModelMatches(refreshed) || (self.caseIdentity.length && ![foldedModelName(refreshed) isEqualToString:foldedModelName(self.caseIdentity)])) {[self caseFailed:HelperExitWrongCaseModel reason:@"case identity refresh did not match the identified case"];return;}
         self.identityRefreshReplies++;self.pending=nil;self.unconfirmedBytes=self.startupUnknownBytes;
     } else if(it==4 && self.caseModelVerified && !self.pending) {
         puts("Late case identity reply ignored");
-    } else [self fail:HelperExitUnexpectedReply reason:@"unexpected case response for pending request"];
+    } else [self caseFailed:HelperExitUnexpectedReply reason:@"unexpected case response for pending request"];
 }
 - (void)tick:(double)now {
     if(self.cleanupStarted || self.error) return;
@@ -624,9 +658,9 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
         self.missedReplies++;self.pending=nil;self.unconfirmedBytes=self.startupUnknownBytes;
         printf("Case identity reply missed (%lu so far); motion carries on\n",(unsigned long)self.missedReplies);return;
     }
-    if(self.pending && now-self.pendingSince>=5) {[self fail:HelperExitReplyTimeout reason:[NSString stringWithFormat:@"case %@ response timed out",self.pending]];return;}
+    if(self.pending && now-self.pendingSince>=5) {[self caseFailed:HelperExitReplyTimeout reason:[NSString stringWithFormat:@"case %@ response timed out",self.pending]];return;}
     if(self.rootModelSent && !self.rootVerified && now-self.rootModelSince>=8) {[self fail:HelperExitIdentityUnavailable reason:@"root Model response timed out"];return;}
-    if(!self.closedWindowStarted) return;
+    if(!self.closedWindowStarted || self.caseSkipped) return;
     if(self.pending || !self.rootVerified || !self.caseActive) return;
     if(!self.caseModelVerified) {
         if(self.caseVersionValid && !self.caseModelSent) {
@@ -642,7 +676,7 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     // Finish accounting for startup before the first MTIC request.
     if(![self initializedCaseRoute]) {
         if(!self.metadataDrainSince) self.metadataDrainSince=now;
-        if(now-self.metadataDrainSince>=5) [self fail:HelperExitReplyTimeout reason:@"case initialization replies remained incomplete"];
+        if(now-self.metadataDrainSince>=5) [self caseFailed:HelperExitReplyTimeout reason:@"case initialization replies remained incomplete"];
         return;
     }
     if(!self.offer && !self.solicitationAttempted) {
@@ -652,7 +686,7 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
         return;
     }
     if(!self.offer) {
-        if(!self.solicitationReceiptVerified) {[self fail:HelperExitUnexpectedReply reason:@"case diagnostic request has no valid receipt"];return;}
+        if(!self.solicitationReceiptVerified) {[self caseFailed:HelperExitUnexpectedReply reason:@"case diagnostic request has no valid receipt"];return;}
         if(!self.offerWaitSince) self.offerWaitSince=now;
         // Each renewal cancels the case's asset-idle timer. Never renew after an
         // offer or a missing/invalid receipt (see WHY THE HELPER TOUCHES MTIC AT ALL).
@@ -693,7 +727,8 @@ static uint16_t nextIdentifier(uint16_t current) {return current==UINT16_MAX ? 1
     if([self sendChild:9 body:packet(body,4)]) {self.cleanupWriteComplete=YES;[self setPending:@"abandon_ack" at:now];}else if(!self.error) [self fail:HelperExitReleaseUnconfirmed reason:@"scoped case MTIC cleanup write failed"];
 }
 - (NSDictionary *)status {
-    return @{@"root_identity_verified":@(self.rootVerified),@"case_identity_verified":@(self.caseModelVerified),@"error":self.error?:@""};
+    return @{@"root_identity_verified":@(self.rootVerified),@"case_identity_verified":@(self.caseModelVerified),@"error":self.error?:@"",
+        @"case_optional":@(self.caseOptional),@"case_keepalive_off":@(self.caseSkipped),@"case_keepalive_off_reason":self.caseSkipReason?:@""};
 }
 @end
 static NSData *varintData(uint32_t value) {
@@ -1068,7 +1103,11 @@ static void hardeningChecks(void) {
 
     // Firmware ModelName matching: tolerant, but still tells the earbud from the case.
     check(earbudModelMatches(@"AirPods Pro") && earbudModelMatches(@" airpods pro\n") && earbudModelMatches(@"AirPods Pro 3") && earbudModelMatches(@"AIRPODS PRO\0"),@"earbud ModelName match ignores case, padding and a model suffix");
-    check(!earbudModelMatches(@"AirPods Charging Case") && !earbudModelMatches(@"AirPods") && !earbudModelMatches(@"Invalid model response") && !earbudModelMatches(nil),@"earbud match rejects the case, other models and missing names");
+    check(!earbudModelMatches(@"AirPods Charging Case") && !earbudModelMatches(@"Invalid model response") && !earbudModelMatches(@"Beats Studio Buds") && !earbudModelMatches(nil),@"earbud match rejects the case, other models and missing names");
+    check(earbudModelMatches(@"AirPods") && earbudModelMatches(@"AirPods 5") && !earbudModelIsPro(@"AirPods 5") && !earbudModelIsPro(@"AirPods") &&
+          earbudModelIsPro(@"AirPods Pro 3") && !earbudModelIsPro(@"AirPods Pro Charging Case") && !earbudModelIsPro(nil),@"AirPods 5 earbuds match and are told apart from AirPods Pro");
+    check(chargingCaseModelMatches(@"AirPods Case") && chargingCaseModelMatches(@"AirPods 5 Charging Case"),@"a non-Pro case ModelName matches");
+    check([loggableModelName(@"AirPods\n\"5\"\x01") isEqualToString:@"airpods?'5'"] && [loggableModelName(@" AirPods 5\n") isEqualToString:@"airpods 5"] && [loggableModelName(nil) isEqualToString:@"(none)"],@"logged model names stay on one printable line");
     check(chargingCaseModelMatches(@"AirPods Charging Case") && chargingCaseModelMatches(@"airpods charging case ") && chargingCaseModelMatches(@"AirPods Pro Charging Case"),@"case ModelName match ignores case and padding");
     check(!chargingCaseModelMatches(@"AirPods Pro") && !chargingCaseModelMatches(@"Charging Case") && !chargingCaseModelMatches(nil),@"case match rejects the earbud name and non-AirPods names");
     CaseSnapshot *root=CaseSnapshot.new;root.targetBound=YES;root.rootModelSent=YES;
@@ -1077,6 +1116,10 @@ static void hardeningChecks(void) {
     CaseSnapshot *wrongRoot=CaseSnapshot.new;wrongRoot.targetBound=YES;wrongRoot.rootModelSent=YES;
     [wrongRoot handleMessage:uarpMessage(4,1,testModel(@"AirPods Charging Case"))];
     check(!wrongRoot.rootVerified && wrongRoot.failure==HelperExitWrongEarbudModel,@"a case ModelName at the root exits WRONG_EARBUD_MODEL");
+    check(!root.caseOptional,@"AirPods Pro keep the required case keep-alive");
+    CaseSnapshot *plainRoot=CaseSnapshot.new;plainRoot.targetBound=YES;plainRoot.rootModelSent=YES;
+    [plainRoot handleMessage:uarpMessage(4,1,testModel(@"AirPods 5"))];
+    check(plainRoot.rootVerified && plainRoot.caseOptional && !plainRoot.error,@"AirPods 5 earbuds verify, with the case keep-alive optional");
     CaseSnapshot *tolerant=testSession();[tolerant.announced addObject:@1];tolerant.caseActive=YES;tolerant.caseModelSent=YES;tolerant.pending=@"model";
     [tolerant handleMessage:testChild(4,10,testModel(@"airpods charging case"))];
     check(tolerant.caseModelVerified && !tolerant.error,@"case identity accepts a case-insensitive ModelName");
@@ -1117,6 +1160,31 @@ static void hardeningChecks(void) {
     CaseSnapshot *noCaseYet=testSession();[noCaseYet.announced addObject:@1];noCaseYet.caseActive=YES;
     for(int t=100;t<=300;t++) [noCaseYet tick:t];
     check(!noCaseYet.error && noCaseYet.caseRequests>0 && !noCaseYet.caseModelVerified,@"a pointer session doesn't end when the case can't be identified");
+
+    // AirPods 5: before an asset is held, a case problem switches the keep-alive off and the session goes on.
+    CaseSnapshot *(^optionalCase)(void)=^CaseSnapshot *{
+        CaseSnapshot *o=testSession();o.caseOptional=YES;[o.announced addObject:@1];o.caseActive=YES;o.caseModelVerified=YES;o.caseRouteDrained=YES;return o;
+    };
+    CaseSnapshot *optDeclined=optionalCase();[optDeclined tick:10];[optDeclined handleMessage:testChild(0x12,53,packet(receipt,8))];[optDeclined handleMessage:testChild(0x13,54,packet(denial,6))];
+    check(!optDeclined.error && optDeclined.caseSkipped && optDeclined.denialReceiptAttempted,@"an AirPods 5 case that declines gets its receipt, and the session goes on");
+    NSUInteger requestsBefore=optDeclined.caseRequests;for(int t=20;t<200;t++) [optDeclined tick:t];
+    check(optDeclined.caseRequests==requestsBefore && !optDeclined.error,@"nothing more goes to a case whose keep-alive is off");
+    [optDeclined handleMessage:testChild(0x12,53,packet(receipt,8))];
+    check(!optDeclined.error && ![optDeclined canSendChild:0x11 body:packet((const uint8_t *)"MTIC",4)],@"later case replies are ignored once the keep-alive is off");
+    CaseSnapshot *optSilent=optionalCase();[optSilent tick:10];[optSilent tick:15];
+    check(!optSilent.error && optSilent.caseSkipped && optSilent.solicitationAttempts==1,@"an AirPods 5 case that never answers switches the keep-alive off");
+    CaseSnapshot *optLost=optionalCase();[optLost handleMessage:uarpMessage(0x19,12,packet(announce,2))];
+    check(!optLost.error && optLost.caseSkipped && !optLost.caseActive,@"an AirPods 5 case going unreachable doesn't end the session");
+    CaseSnapshot *optWrong=testSession();optWrong.caseOptional=YES;[optWrong.announced addObject:@1];optWrong.caseActive=YES;optWrong.caseModelSent=YES;optWrong.pending=@"model";
+    [optWrong handleMessage:testChild(4,10,testModel(@"AirPods 5"))];
+    check(!optWrong.error && optWrong.caseSkipped && !optWrong.caseModelVerified,@"an AirPods 5 case with an unknown ModelName switches the keep-alive off");
+    CaseSnapshot *optHeld=optionalCase();optHeld.offer=testOffer(7,35);optHeld.offerMetadata=mticOffer(optHeld.offer);[optHeld tick:NSProcessInfo.processInfo.systemUptime];
+    check(optHeld.accepted,@"an AirPods 5 case can still hold an offered asset");
+    [optHeld handleMessage:uarpMessage(0x19,13,packet(announce,2))];
+    check(optHeld.failure==HelperExitCaseLost && !optHeld.caseSkipped,@"once an AirPods 5 case holds an asset, losing the case still ends the session");
+    CaseSnapshot *proDeclined=testSession();[proDeclined.announced addObject:@1];proDeclined.caseActive=YES;proDeclined.caseModelVerified=YES;proDeclined.caseRouteDrained=YES;
+    [proDeclined tick:10];[proDeclined handleMessage:testChild(0x12,53,packet(receipt,8))];[proDeclined handleMessage:testChild(0x13,54,packet(denial,6))];
+    check(proDeclined.failure==HelperExitCaseDeclined && !proDeclined.caseSkipped,@"AirPods Pro still end the session when the case declines");
 
     // Root VERSION heartbeat: a lost reply is re-asked, then ends the session; never silent.
     check(steadyRootVersionAction(NO,YES,5,100)==RootVersionWait && steadyRootVersionAction(YES,NO,0,100)==RootVersionWait,@"heartbeat recovery applies only to a pending steady-state query");

@@ -22,7 +22,7 @@ final class App: NSObject, NSApplicationDelegate {
     var setupTaps=SetupTaps()
     // Set when the person backs out of closed-case calibration, so the dots don't reopen on the next tick.
     var closedCalibrationDeclined=false
-    // Paired AirPods Pro, refreshed when Settings opens.
+    // Paired AirPods Pro and AirPods 5, refreshed when Settings opens.
     var closedCasePairs:[ClosedCaseAirPods]=[]
     var timer: Timer?
     var homeMenuItems:[NSMenuItem]=[]
