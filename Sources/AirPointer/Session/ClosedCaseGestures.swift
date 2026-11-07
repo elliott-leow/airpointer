@@ -37,15 +37,21 @@ enum FlickAxis:String,CaseIterable {
 }
 
 // One taught gesture: the axis the case swings about, in the case's own frame, and how fast its faster
-// swing has to be (°/s). The struct keeps the name it had when gestures were single flicks.
+// swing has to be (°/s), kept between 300 and 340. Aiming never comes near 300°/s, so a higher bar adds no
+// safety and only misses everyday flicks, which are far gentler than eager taught ones (those reach
+// 1100°/s, everyday ones 370°/s). Teaching can lower the bar for a gentle hand, never raise it; bars saved
+// higher come back capped. The struct keeps the name it had when gestures were single flicks.
 struct ClosedCaseFlick:Equatable {
     var axis:SIMD3<Double>,peak:Double
     var stored:[Double]{[axis.x,axis.y,axis.z,peak]}
-    init(axis:SIMD3<Double>,peak:Double){let n=(axis*axis).sum().squareRoot();self.axis=n>0 ? axis/n:axis;self.peak=peak}
+    init(axis:SIMD3<Double>,peak:Double) {
+        let n=(axis*axis).sum().squareRoot();self.axis=n>0 ? axis/n:axis
+        self.peak=min(ClosedCaseFlickDetector.highestPeak,max(ClosedCaseFlickDetector.lowestPeak,peak))
+    }
     init?(stored:[Double]?) {
         guard let stored,stored.count==4,stored.allSatisfy(\.isFinite),stored[3]>0 else{return nil}
         let axis=SIMD3(stored[0],stored[1],stored[2]);guard (axis*axis).sum()>0.25 else{return nil}
-        self.init(axis:axis,peak:max(ClosedCaseFlickDetector.lowestPeak,stored[3]))
+        self.init(axis:axis,peak:stored[3])
     }
 }
 
@@ -62,9 +68,11 @@ struct ClosedCaseFlickDetector {
     // `turn` is the first swing's rotation, to tell up from down and left from right.
     enum Event:Equatable{case flick(FlickAxis,turn:SIMD3<Double>,since:Double)}
     // Rotation rates in degrees per second, angles in degrees, times in seconds.
-    static let defaultPeak=340.0,lowestPeak=300.0,onset=40.0,calm=60.0,slowerShare=0.35
+    // Tuned on real use: everyday flicks go out at 370–870°/s and come back at 20–45% of that, often
+    // starting while the hand still moves at up to 100°/s from the last one.
+    static let defaultPeak=340.0,lowestPeak=300.0,highestPeak=340.0,onset=40.0,calm=100.0,slowerShare=0.2
     static let shortestSwing=0.05,longestSwing=0.6,smallestSwing=15.0,largeSwing=30.0,offAxisShare=0.65
-    static let alignment=0.7,margin=0.08,settle=0.25,fade=0.15,maximumGap=0.1
+    static let alignment=0.7,margin=0.08,settle=0.2,settleBelow=80.0,fade=0.15,maximumGap=0.1
     var flicks:[FlickAxis:ClosedCaseFlick]=[:]
     struct Swing{var sign:Double,start:Double,end=0.0,peak:Double,angle=0.0,turn=SIMD3<Double>.zero,off:Double,quietSince:Double?=nil}
     private struct Track{var swing:Swing?,previous:Swing?,steady=false}
@@ -89,7 +97,7 @@ struct ClosedCaseFlickDetector {
         if dt>Self.maximumGap{tracks=[:]}
         last=t
         defer{recent.append((t,w));while let first=recent.first,t-first.t>0.3{recent.removeFirst()}}
-        if speed<Self.onset{quietSince=quietSince ?? t}else{quietSince=nil}
+        if speed<Self.settleBelow{quietSince=quietSince ?? t}else{quietSince=nil}
         if settling {
             guard let quietSince,t-quietSince>=Self.settle else{return []}
             settling=false;tracks=[:]
@@ -141,8 +149,8 @@ func closedCaseFlickGesture(_ axis:FlickAxis,turn:SIMD3<Double>,up:SIMD3<Double>
 // from a steady moment until the case settles; its axis is the one it turned about most; every pair of swings
 // along that axis that is fast and big (judged with a bar of 250°/s) is one example, so a natural "yes, yes,
 // yes" teaches it at once, and nods with pauses between do too. The dots fill while the person nods. Nods
-// up-first or down-first are one axis. The speed then needed is 70% of the typical faster swing, never under
-// 300°/s. A burst that swings clearly but too gently says so.
+// up-first or down-first are one axis. The speed then needed is 70% of the typical faster swing, kept
+// between 300 and 340°/s. A burst that swings clearly but too gently says so.
 struct ClosedCaseFlickLearner {
     enum Event:Equatable{case flick(agreeing:Int,total:Int),tooSlow,learned(ClosedCaseFlick),failed}
     static let flicks=3,mostFlicks=10,agree=0.85,learningBar=250.0,peakShare=0.7,longestBurst=4.0,checkEvery=0.15
@@ -221,7 +229,7 @@ struct ClosedCaseFlickLearner {
         if members.count>heard{heard=members.count;events.append(.flick(agreeing:members.count,total:all.count))}
         if members.count>=Self.flicks {
             let peaks=members.map(\.peak).sorted(),typical=peaks[peaks.count/2],sum=members.reduce(SIMD3<Double>.zero){$0+$1.axis}
-            done=true;events.append(.learned(ClosedCaseFlick(axis:sum,peak:max(Detector.lowestPeak,typical*Self.peakShare))))
+            done=true;events.append(.learned(ClosedCaseFlick(axis:sum,peak:typical*Self.peakShare)))
         } else if all.count>=Self.mostFlicks{done=true;events.append(.failed)}
         return events
     }
@@ -232,6 +240,34 @@ struct ClosedCaseFlickLearner {
         if live.isEmpty,let axis=Self.principalAxis(burst.map(\.w)),(burst.map{abs(($0.w*axis).sum())}.max() ?? 0)>=120{events.append(.tooSlow)}
         examples+=live
         return events
+    }
+}
+
+// Keeps the pointer where a click or a flick left it. A tap or a flick turns the case a few degrees (a tap
+// about 5°, some 200 px), so once the pointer is let go it would jump to where the case now points. Instead the
+// difference is kept as an offset that fades only as the person moves: half as fast as the pointer moves, so
+// it's gone once they've moved twice as far, and never while they hold still. Pointing past a screen edge, where
+// the aim can't move further, it fades over about a second, so every edge stays reachable.
+struct ClosedCasePointerAnchor {
+    static let catchUp=0.5,edgeFade=1.0,edge=0.001
+    private(set) var offset=CGVector.zero
+    private var last:CGPoint?,lastTime:Double?
+    // `aim` is where the case points now; the pointer stays at `point`.
+    mutating func anchor(_ aim:CGPoint,at point:CGPoint){offset=CGVector(dx:point.x-aim.x,dy:point.y-aim.y);last=aim}
+    mutating func reset(){offset = .zero;last=nil;lastTime=nil}
+    mutating func apply(_ aim:CGPoint,at time:Double)->CGPoint {
+        defer{last=aim;lastTime=time}
+        let size=hypot(offset.dx,offset.dy)
+        if size>0,let last {
+            let keep=max(0,1-Self.catchUp*hypot(aim.x-last.x,aim.y-last.y)/size)
+            offset.dx*=keep;offset.dy*=keep
+            if let lastTime,time>lastTime {
+                let fade=exp(-(time-lastTime)/Self.edgeFade)
+                if (aim.x<=Self.edge && offset.dx>0) || (aim.x>=1-Self.edge && offset.dx<0){offset.dx*=fade}
+                if (aim.y<=Self.edge && offset.dy>0) || (aim.y>=1-Self.edge && offset.dy<0){offset.dy*=fade}
+            }
+        }
+        return CGPoint(x:min(1,max(0,aim.x+offset.dx)),y:min(1,max(0,aim.y+offset.dy)))
     }
 }
 
@@ -446,7 +482,7 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
     guard run(motion(3,[(1,-up,500,0.25)]),both).isEmpty else{throw LessonError.message("One swing with no swing back must not count.")}
     let diagonal=(up+side)/length(up+side)
     guard run(motion(3,nod(diagonal)),both).isEmpty else{throw LessonError.message("A nod between the two axes must count as neither.")}
-    guard run(motion(3,nod(up),drift:SIMD3(0,0,90)),both).isEmpty else{throw LessonError.message("A nod that doesn’t start from a steady aim must not count.")}
+    guard run(motion(3,nod(up),drift:SIMD3(0,0,130)),both).isEmpty else{throw LessonError.message("A nod that doesn’t start from a steady aim must not count.")}
     var detail="flicks at 340°/s or more, up, down, left and right by their first swing, one per burst, not slow, small, one-way, diagonal or unsteady ones"
     if let fixtures {
         // The recorded natural nod and shake: their own axes, then one Yes and one No.
@@ -496,6 +532,11 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
     guard let onceLearned=once.learned,abs((onceLearned.axis*axis).sum())>0.98,abs(onceLearned.peak-max(300,0.7*460))<15,once.counts==[1,2,3] else{
         throw LessonError.message("Nodding three times in one go must teach it, a dot at a time: \(once).")
     }
+    let eager=teach(nod(axis,at:1,fast:700,cycles:3),seconds:4)
+    guard eager.learned?.peak==ClosedCaseFlickDetector.highestPeak,ClosedCaseFlick(stored:[0,1,0,775])?.peak==ClosedCaseFlickDetector.highestPeak,
+          ClosedCaseFlick(stored:[0,1,0,120])?.peak==ClosedCaseFlickDetector.lowestPeak else{
+        throw LessonError.message("Teaching eagerly must not set a bar that misses everyday flicks: \(String(describing:eager.learned)).")
+    }
     let apart=teach(nod(axis,at:1,fast:420)+nod(stray,at:3,fast:500)+nod(-axis,at:5,fast:480)+nod(axis,at:7,fast:460),seconds:10)
     guard let apartLearned=apart.learned,abs((apartLearned.axis*axis).sum())>0.98,apart.counts.last==3 else{
         throw LessonError.message("Nods with pauses must teach it, leaving a stray shake out: \(apart).")
@@ -503,7 +544,7 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
     var gentle=ClosedCaseFlickLearner(),saidSlow=false
     for (stamp,w) in motion(4,nod(axis,fast:200,slow:150)){if gentle.feed(stamp:stamp,w:w).contains(.tooSlow){saidSlow=true}}
     guard saidSlow else{throw LessonError.message("A nod too gentle to learn must say so.")}
-    detail+="; one natural yes-yes-yes teaches it, a dot a nod, and so do nods with pauses, without a stray one"
+    detail+="; bars kept to 300–340°/s however eagerly taught; one natural yes-yes-yes teaches it, a dot a nod, and so do nods with pauses, without a stray one"
     // Double tap: two close taps are one gesture; one tap clicks once its window has passed.
     var gate=ClosedCaseDoubleTap();let a=CGPoint(x:0.2,y:0.3),b=CGPoint(x:0.4,y:0.5)
     guard gate.tap(since:1,point:a,now:10).isEmpty,gate.tap(since:1.2,point:b,now:10.2)==[.double(a)],!gate.waiting,
@@ -511,6 +552,19 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
           gate.tap(since:3,point:a,now:12).isEmpty,gate.tap(since:3.5,point:b,now:12.5)==[.click(a)],gate.waiting else{
         throw LessonError.message("Two quick taps must be one double tap, and a single tap must click after its window.")
     }
+    // The anchor: held still, the pointer stays where it was clicked; moving, it catches up with the aim.
+    var anchor=ClosedCasePointerAnchor()
+    anchor.anchor(CGPoint(x:0.6,y:0.5),at:CGPoint(x:0.5,y:0.5))
+    var held=CGPoint.zero
+    for i in 0..<200{held=anchor.apply(CGPoint(x:0.6,y:0.5),at:Double(i)*0.005)}
+    guard abs(held.x-0.5)<1e-9 else{throw LessonError.message("After a click the pointer must stay where it clicked: \(held).")}
+    var moved=CGPoint.zero
+    for i in 0...100{moved=anchor.apply(CGPoint(x:0.6,y:0.5+0.002*Double(i)),at:1+Double(i)*0.005)}
+    guard abs(moved.y-0.7)<1e-9,abs(moved.x-0.6)<1e-6 else{throw LessonError.message("Moving twice the offset must bring the pointer back to the aim: \(moved).")}
+    var edgeAnchor=ClosedCasePointerAnchor();edgeAnchor.anchor(CGPoint(x:0,y:0.5),at:CGPoint(x:0.1,y:0.5))
+    var atEdge=CGPoint.zero
+    for i in 0..<800{atEdge=edgeAnchor.apply(CGPoint(x:0,y:0.5),at:Double(i)*0.005)}
+    guard atEdge.x<0.003 else{throw LessonError.message("Pointing past an edge must reach it: \(atEdge).")}
     // The glide eases toward the aim, carries on through a short gap, and settles after a long one.
     var glide=ClosedCaseCursorGlide()
     glide.aim(CGPoint(x:0.5,y:0.5),at:0);_=glide.step(at:0)
@@ -531,5 +585,5 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
           GestureShortcut.refusal(custom.shortcut!,pointer:pointer,others:[]) == nil else{
         throw LessonError.message("Gesture shortcuts must refuse quitting, the pointer shortcut and a shortcut another gesture sends.")
     }
-    return "gestures: "+detail+"; double tap; cursor glide; actions stored and risky shortcuts refused"
+    return "gestures: "+detail+"; double tap; the pointer stays where it clicked until moved; cursor glide; actions stored and risky shortcuts refused"
 }

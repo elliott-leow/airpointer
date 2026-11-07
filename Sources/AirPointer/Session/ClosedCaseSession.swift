@@ -19,9 +19,10 @@ struct ClosedCasePointerFilter{
         let derivativeAlpha=alpha(3)
         velocity.x+=derivativeAlpha*((point.x-previous.x)/dt-velocity.x)
         velocity.y+=derivativeAlpha*((point.y-previous.y)/dt-velocity.y)
-        // Steady while the aim holds still (hand tremor stays under 1.2 Hz), quick once it moves: at a slow
-        // aim of 5% of the screen a second the cutoff is about 2 Hz, sweeping a screen a second 15 Hz.
-        let cutoff=min(30,1.2+14*hypot(velocity.x,velocity.y)),a=alpha(cutoff)
+        // Steady while the aim holds still, quick once it moves: 0.4 Hz at rest, about 1.4 Hz at a slow aim of 5%
+        // of the screen a second, 20 Hz sweeping a screen a second. On recorded pointing that's 16% less drift
+        // holding still and 16% less lag aiming than the 1.2 + 14×speed it replaced.
+        let cutoff=min(30,0.4+20*hypot(velocity.x,velocity.y)),a=alpha(cutoff)
         let next=CGPoint(x:filtered.x+a*(point.x-filtered.x),y:filtered.y+a*(point.y-filtered.y))
         self.previous=point;self.filtered=next;self.time=stamp;return next
     }
@@ -566,6 +567,8 @@ final class ClosedCaseSession: NSObject {
     private var generation=0, lastStatus=0.0, lastHost=0.0, pressedAt=0.0, loggedReady=false
     private var smooth=CGPoint(x:0.5,y:0.5), feedError:String?
     private var pointerFilter=ClosedCasePointerFilter()
+    // Where a click or a flick left the pointer, kept once it's let go (ClosedCasePointerAnchor).
+    private var anchor=ClosedCasePointerAnchor(),anchorAt:CGPoint?
     private var readStats=(count:0,total:0.0,longest:0.0,since:0.0)
     private var tapDetector=ClosedCaseTapDetector(),recentPoints:[(t:Double,point:CGPoint)]=[],tapHold:CGPoint?
     private var lastClick:(uptime:Double,position:CGPoint,count:Int64)?
@@ -634,7 +637,7 @@ final class ClosedCaseSession: NSObject {
         return true
     }
     private func finishCalibration(resume:Bool){
-        calibrated=true;hasPointed=false;smooth=CGPoint(x:0.5,y:0.5);pointerFilter=ClosedCasePointerFilter();setAim(smooth);glide.reset()
+        calibrated=true;hasPointed=false;smooth=CGPoint(x:0.5,y:0.5);pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil;setAim(smooth);glide.reset()
         step("pointing")
         readStatus()
         if resume || pointsWhenReady{resumeAfterDrop=false;toggleCursor()}
@@ -669,7 +672,7 @@ final class ClosedCaseSession: NSObject {
         }
         if let savedGrip=cachedGrip{motion?.loadGrip(savedGrip)}
         calibrated=false;generation=0;lastHost=0;pending=Data();smooth=CGPoint(x:0.5,y:0.5)
-        pointerFilter=ClosedCasePointerFilter()
+        pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil
         setAim(smooth);glide.reset();flickDetector.reset();doubleTap.reset();feedError=nil;savedMeasure=0
     }
     private func saveCalibration(){
@@ -693,7 +696,7 @@ final class ClosedCaseSession: NSObject {
             turned=false;uprightSince=nil;settle=nil;closedPose=nil
             closedGravity=motion?.accelVector
             heldGravity=motion?.gripGravity
-            pointerFilter=ClosedCasePointerFilter()
+            pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil
         }catch{fail(error.localizedDescription)}
     }
     private func start(){
@@ -962,7 +965,7 @@ final class ClosedCaseSession: NSObject {
                 motion.resetGrip(keepingEdges:true)
                 generation=nextGeneration;calibrated=false;pause();resumeAfterDrop=resume
                 smooth=CGPoint(x:0.5,y:0.5);setAim(smooth);glide.reset();flickDetector.reset()
-                pointerFilter=ClosedCasePointerFilter();recentPoints=[];tapHold=nil;settle=nil
+                pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil;recentPoints=[];tapHold=nil;settle=nil
             }
             guard host>lastHost,abs(host-accelHost)<0.25 else{return}
             lastHost=host
@@ -979,10 +982,14 @@ final class ClosedCaseSession: NSObject {
             feedFlicks(rows,result)
             guard calibrated,let point=result["point"] as? [Double],point.count==2,point.allSatisfy(\.isFinite) else{return}
             let x=0.5+(point[0]-0.5)*speed,y=0.5+(point[1]-0.5)*speed,now=ProcessInfo.processInfo.systemUptime
-            if let tapHold{smooth=tapHold;glide.snap(tapHold,at:now)}
-            else if now<gestureHoldUntil{glide.snap(smooth,at:now)}
+            // The filter follows the case even while a click or flick holds the pointer, so when it's let go
+            // the pointer stays put and the case's aim carries on from there.
+            let aim=pointerFilter.feed(CGPoint(x:min(1,max(0,x)),y:min(1,max(0,y))),at:stamp*1e-6)
+            if let tapHold{smooth=tapHold;anchorAt=tapHold;glide.snap(tapHold,at:now)}
+            else if now<gestureHoldUntil{anchorAt=smooth;glide.snap(smooth,at:now)}
             else{
-                smooth=pointerFilter.feed(CGPoint(x:min(1,max(0,x)),y:min(1,max(0,y))),at:stamp*1e-6)
+                if let anchorAt{anchor.anchor(aim,at:anchorAt);self.anchorAt=nil}
+                smooth=anchor.apply(aim,at:stamp*1e-6)
                 recentPoints.append((stamp*1e-6,smooth));while let first=recentPoints.first,stamp*1e-6-first.t>0.5{recentPoints.removeFirst()}
                 glide.aim(smooth,at:now)
             }
@@ -1005,7 +1012,7 @@ final class ClosedCaseSession: NSObject {
         pause()
         _=motion.run("rawGrip.center=[...rawFusion.q]")
         if motion.lastException != nil{feedError=nil;return}
-        smooth=CGPoint(x:0.5,y:0.5);pointerFilter=ClosedCasePointerFilter();setAim(smooth);glide.reset();readStatus()
+        smooth=CGPoint(x:0.5,y:0.5);pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil;setAim(smooth);glide.reset();readStatus()
         saveCalibration()
     }
     private func toggleCursor(){
@@ -1062,7 +1069,7 @@ final class ClosedCaseSession: NSObject {
                 guard gestureActions[gesture] ?? .nothing != .nothing else{try? log?.write(contentsOf:Data("gesture: \(gesture.title), which does nothing\n".utf8));continue}
                 // The flick swung the pointer; it goes back to where it was, and holds there a moment.
                 let at=recentPoints.last{$0.t<since}?.point ?? smooth,now=ProcessInfo.processInfo.systemUptime
-                smooth=at;pointerFilter=ClosedCasePointerFilter();gestureHoldUntil=now+0.3;glide.snap(at,at:now)
+                smooth=at;gestureHoldUntil=now+0.3;glide.snap(at,at:now)
                 if let bounds=pointerBounds(){CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:screenPoint(at,bounds:bounds),mouseButton:.left)?.post(tap:.cghidEventTap)}
                 performGesture(gesture,at:at)
             }
