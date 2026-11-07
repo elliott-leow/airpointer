@@ -16,13 +16,14 @@ struct ClosedCasePointerFilter{
         guard dt>0 else{return filtered}
         if dt>0.25{self=ClosedCasePointerFilter();return feed(point,at:stamp)}
         func alpha(_ cutoff:Double)->Double{dt/(dt+1/(2 * .pi * cutoff))}
-        let derivativeAlpha=alpha(3)
+        let derivativeAlpha=alpha(2)
         velocity.x+=derivativeAlpha*((point.x-previous.x)/dt-velocity.x)
         velocity.y+=derivativeAlpha*((point.y-previous.y)/dt-velocity.y)
-        // Steady while the aim holds still, quick once it moves: 0.4 Hz at rest, about 1.4 Hz at a slow aim of 5%
-        // of the screen a second, 20 Hz sweeping a screen a second. On recorded pointing that's 16% less drift
-        // holding still and 16% less lag aiming than the 1.2 + 14×speed it replaced.
-        let cutoff=min(30,0.4+20*hypot(velocity.x,velocity.y)),a=alpha(cutoff)
+        // Steady while the aim holds still, quick once it moves: 0.3 Hz at rest, about 1 Hz at a slow aim of 5%
+        // of the screen a second, 15 Hz sweeping a screen a second. Fed every sample (200 Hz) rather than each
+        // Bluetooth burst, on recorded pointing that's 10% less wobble holding still and 5% aiming than
+        // 0.4 + 20×speed, for 2 px more lag aiming slowly.
+        let cutoff=min(30,0.3+15*hypot(velocity.x,velocity.y)),a=alpha(cutoff)
         let next=CGPoint(x:filtered.x+a*(point.x-filtered.x),y:filtered.y+a*(point.y-filtered.y))
         self.previous=point;self.filtered=next;self.time=stamp;return next
     }
@@ -201,8 +202,11 @@ final class ClosedCaseMotion {
     func feed(_ rows:[[Double]])->[String:Any]?{
         context.setObject(rows,forKeyedSubscript:"rawRows" as NSString)
         return run("""
-        for(const row of rawRows)rawFusion.feed(row);
-        ({ready:rawFusion.ready,generation:rawFusion.generation,measured:rawFusion.measured,
+        var points=[];
+        for(const row of rawRows){
+          if(rawFusion.feed(row)&&row[1]===12&&rawFusion.ready){const p=rawGrip.point(rawFusion.q,true);if(p)points.push([row[2],row[3],p[0],p[1]]);}
+        }
+        ({ready:rawFusion.ready,generation:rawFusion.generation,measured:rawFusion.measured,points:points,
           gyro:rawFusion.last[12] || {},accel:rawFusion.last[11] || {},g:rawFusion.accel&&rawFusion.accel.vector,
           point:rawGrip.point(rawFusion.q),q:rawFusion.q,edges:rawGrip.edges!==null,
           bias:rawFusion.bias,right:rawGrip.right,up:rawGrip.up})
@@ -396,6 +400,20 @@ func runClosedCaseNativeChecks() throws {
     context.setObject([[1.0,11.0,5000000.0,5.0,0.0,0.0,100000.0]],forKeyedSubscript:"rawRows" as NSString)
     context.evaluateScript("for(const row of rawRows)rawFusion.feed(row)")
     guard context.exception==nil else{throw LessonError.message("Native sample array conversion failed.")}
+    // Every gyro sample's point comes back, with its time, and past the screen's edges too: 30° right of
+    // center with the right edge at 20° is a quarter screen past it.
+    let pointing=ClosedCaseMotion(context:try makeClosedCaseMotionContext())
+    pointing.loadCalibration(["bias":[0.0,0.0,0.0]])
+    var motionRows:[[Double]]=[],motionStamp=2_000_000.0,motionSeq=0.0
+    func pair(_ w:[Double]){motionStamp+=5000;motionSeq+=2;motionRows+=[[motionSeq-1,11,motionStamp,motionStamp/1e6,0,0,100000],[motionSeq,12,motionStamp+1000,motionStamp/1e6]+w.map{$0*1e5}]}
+    for _ in 0..<20{pair([0,0,0])}
+    _=pointing.feed(motionRows);motionRows=[]
+    _=pointing.run("rawGrip.center=[...rawFusion.q];rawGrip.right=[0,0,0.349066];rawGrip.up=[0,0.349066,0]")
+    for _ in 0..<100{pair([0,0,60])}
+    guard let points=pointing.feed(motionRows)?["points"] as? [[Double]],points.count==100,let past=points.last,past.count==4,
+          past[0]==motionStamp+1000,abs(past[2]-1.25)<0.01,abs(past[3]-0.5)<0.01 else{
+        throw LessonError.message("Every gyro sample's point must come back, past the edges too.")
+    }
     context.evaluateScript("rawGrip.setCenter(rawFusion.q);rawGrip.setAxis('right',rawFusion.q)")
     guard context.exception != nil else{throw LessonError.message("Native calibration errors must remain recoverable.")}
     context.exception=nil
@@ -477,7 +495,7 @@ func runClosedCaseNativeChecks() throws {
           !closedCaseUpright([0,0,1],closed:[0,0,1],held:[1,0,0]) else{
         throw LessonError.message("Upright must follow a quarter turn from the closed pose or the pose of the saved edges.")
     }
-    print("PASS: AirPods found by product ID with a plain reason for each failure, motion code in JavaScriptCore, known angular motion, a saved offset in any pose, a hand-held first offset, gentle re-measuring, upright from a quarter turn, bridge types and raw array conversion; no device or cursor operations, bounded helper log and newest-session pruning, the lid from paired in-case reports and from the lid broadcast, short-drop hold, long-drop restart and saved grip edges")
+    print("PASS: AirPods found by product ID with a plain reason for each failure, motion code in JavaScriptCore, known angular motion, a saved offset in any pose, a hand-held first offset, gentle re-measuring, upright from a quarter turn, bridge types, raw array conversion and every sample's point past the edges; no device or cursor operations, bounded helper log and newest-session pruning, the lid from paired in-case reports and from the lid broadcast, short-drop hold, long-drop restart and saved grip edges")
 }
 
 enum ClosedCaseStage:Equatable{case off,openLid,connecting,closeLid,settling,holding,calibrating,ready,pointing}
@@ -509,21 +527,24 @@ final class ClosedCaseSession: NSObject {
     var tapDirection:[Double]?{didSet{tapDetector.direction=tapDirection.flatMap{$0.count==3 ? SIMD3($0[0],$0[1],$0[2]):nil} ?? ClosedCaseTapDetector.tapDirection}}
     // Taps are found in the accelerometer, which AirPods 5 don't stream to AirPointer, so they don't click yet.
     var tapsAvailable:Bool{!gyroOnly}
-    // Gestures (ClosedCaseGestures.swift). Each does nothing until Settings gives it an action. Yes and No
-    // use the flicks taught in Settings, or, untaught, the calibrated up and right axes.
+    // Gestures (ClosedCaseGestures.swift). Each does nothing until Settings gives it an action; a flick also
+    // has to be taught, since everyone flicks differently.
     var gestureActions:[CaseGesture:GestureAction]=[:]{didSet{if gestureActions[.doubleTap] ?? .nothing == .nothing{doubleTap.reset()}}}
-    var taughtFlicks:[FlickAxis:ClosedCaseFlick]=[:]
+    var taughtFlicks:[CaseGesture:ClosedCaseFlickTemplate]=[:]
     // A tap clicks unless Settings maps it to something else.
     private var tapClicks:Bool{(gestureActions[.tap] ?? .click) == .click}
-    private var flickDetector=ClosedCaseFlickDetector(),flickLearner:ClosedCaseFlickLearner?,onFlickLearning:((ClosedCaseFlickLearner.Event)->Void)?
-    private var doubleTap=ClosedCaseDoubleTap(),gestureHoldUntil=0.0,lastPointUpdate=0.0
+    private var flickRecognizer=ClosedCaseFlickRecognizer(),flickTeacher:ClosedCaseFlickTeacher?,onFlickTeaching:((ClosedCaseFlickTeacher.Event)->Void)?
+    // Where the pointer holds while a burst turns fast enough to be a flick, and after one, until when (sensor s).
+    private var flickHold:CGPoint?,gestureHoldAt:CGPoint?,gestureHoldUntil=0.0
+    private var doubleTap=ClosedCaseDoubleTap(),lastPointUpdate=0.0
     // The cursor itself, moved once per display refresh on its own thread (ClosedCaseCursorOutput).
     private let cursor=ClosedCaseCursorOutput()
     private var cursorFrames=0
     // Teaching a flick needs live motion with the gyro's offset known; the pointer can be paused.
     var canTeachFlicks:Bool{inputReady && motion?.fusionReady==true}
-    func learnFlick(_ handler:@escaping(ClosedCaseFlickLearner.Event)->Void){flickLearner=ClosedCaseFlickLearner();onFlickLearning=handler}
-    func stopLearningFlick(){flickLearner=nil;onFlickLearning=nil}
+    // Teaching one flick, kept apart from the others already taught.
+    func learnFlick(_ gesture:CaseGesture,others:[CaseGesture:ClosedCaseFlickTemplate],_ handler:@escaping(ClosedCaseFlickTeacher.Event)->Void){flickTeacher=ClosedCaseFlickTeacher(gesture:gesture,others:others);onFlickTeaching=handler}
+    func stopLearningFlick(){flickTeacher=nil;onFlickTeaching=nil}
     var onEnded:((String?)->Void)?
     var opensLidFirst=false
     private(set) var lostContact=false
@@ -571,7 +592,7 @@ final class ClosedCaseSession: NSObject {
     private var smooth=CGPoint(x:0.5,y:0.5), feedError:String?
     private var pointerFilter=ClosedCasePointerFilter()
     // Where a click or a flick left the pointer, kept once it's let go (ClosedCasePointerAnchor).
-    private var anchor=ClosedCasePointerAnchor(),anchorAt:CGPoint?
+    private var anchor=ClosedCasePointerAnchor(),anchorAt:CGPoint?,anchorKeeps=false
     private var readStats=(count:0,total:0.0,longest:0.0,since:0.0)
     private var tapDetector=ClosedCaseTapDetector(),recentPoints:[(t:Double,point:CGPoint)]=[],tapHold:CGPoint?
     private var lastClick:(uptime:Double,position:CGPoint,count:Int64)?
@@ -676,7 +697,7 @@ final class ClosedCaseSession: NSObject {
         if let savedGrip=cachedGrip{motion?.loadGrip(savedGrip)}
         calibrated=false;generation=0;lastHost=0;pending=Data();smooth=CGPoint(x:0.5,y:0.5)
         pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil
-        setAim(smooth);cursor.with{$0.reset()};flickDetector.reset();doubleTap.reset();feedError=nil;savedMeasure=0
+        setAim(smooth);cursor.with{$0.reset()};flickRecognizer.reset();flickHold=nil;gestureHoldAt=nil;doubleTap.reset();feedError=nil;savedMeasure=0
     }
     private func saveCalibration(){
         guard let motion,motion.measured>savedMeasure,let values=motion.calibrationValues,let targetHash else{return}
@@ -967,7 +988,7 @@ final class ClosedCaseSession: NSObject {
                 let resume=enabled || resumeAfterDrop
                 motion.resetGrip(keepingEdges:true)
                 generation=nextGeneration;calibrated=false;pause();resumeAfterDrop=resume
-                smooth=CGPoint(x:0.5,y:0.5);setAim(smooth);cursor.with{$0.reset()};flickDetector.reset()
+                smooth=CGPoint(x:0.5,y:0.5);setAim(smooth);cursor.with{$0.reset()};flickRecognizer.reset();flickHold=nil;gestureHoldAt=nil
                 pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil;recentPoints=[];tapHold=nil;settle=nil
             }
             guard host>lastHost,abs(host-accelHost)<0.25 else{return}
@@ -983,19 +1004,24 @@ final class ClosedCaseSession: NSObject {
                 }else{settle=(stamp,q)}
             }
             feedFlicks(rows,result)
-            guard calibrated,let point=result["point"] as? [Double],point.count==2,point.allSatisfy(\.isFinite) else{return}
-            let x=0.5+(point[0]-0.5)*speed,y=0.5+(point[1]-0.5)*speed,now=ProcessInfo.processInfo.systemUptime
-            // The filter follows the case even while a click or flick holds the pointer, so when it's let go
-            // the pointer stays put and the case's aim carries on from there.
-            let aim=pointerFilter.feed(CGPoint(x:min(1,max(0,x)),y:min(1,max(0,y))),at:stamp*1e-6)
-            if let tapHold{smooth=tapHold;anchorAt=tapHold;cursor.with{$0.hold(tapHold,at:now)}}
-            else if now<gestureHoldUntil{anchorAt=smooth;cursor.with{$0.hold(smooth,at:now)}}
-            else{
-                if let anchorAt{anchor.anchor(aim,at:anchorAt);self.anchorAt=nil}
-                smooth=anchor.apply(aim,at:stamp*1e-6)
-                recentPoints.append((stamp*1e-6,smooth));while let first=recentPoints.first,stamp*1e-6-first.t>0.5{recentPoints.removeFirst()}
-                cursor.with{$0.aim(smooth,at:now)}
+            guard calibrated,let points=result["points"] as? [[Double]] else{return}
+            // Every gyro sample's aim, in the sensor's time, may lie past the screen's edges. The filter follows the
+            // case even while a click or flick holds the pointer, so when it's let go the pointer stays put and the
+            // case's aim carries on from there. The cursor replays the result at the display's pace.
+            var track:[(point:CGPoint,t:Double,host:Double)]=[]
+            for sample in points where sample.count==4 && sample.allSatisfy(\.isFinite) {
+                let t=sample[0]*1e-6,host=sample[1]
+                let aim=pointerFilter.feed(CGPoint(x:0.5+(sample[2]-0.5)*speed,y:0.5+(sample[3]-0.5)*speed),at:t)
+                if let held=tapHold ?? flickHold ?? (t<gestureHoldUntil ? gestureHoldAt:nil) {
+                    smooth=held;anchorAt=held;anchorKeeps=tapHold==nil
+                } else {
+                    if let anchorAt{anchor.anchor(aim,at:anchorAt,keep:anchorKeeps);self.anchorAt=nil}
+                    smooth=anchor.apply(aim,at:t)
+                    recentPoints.append((t,smooth));while let first=recentPoints.first,t-first.t>1.5{recentPoints.removeFirst()}
+                }
+                track.append((smooth,t,host))
             }
+            if !track.isEmpty{cursor.with{timeline in for sample in track{timeline.add(sample.point,at:sample.t,arrived:sample.host)}}}
         }
     }
     // How long a read of motion holds up the main run loop, for the session log.
@@ -1029,8 +1055,7 @@ final class ClosedCaseSession: NSObject {
         // Pointing starts from wherever the cursor is, and glides to the aim.
         if let bounds=pointerBounds(),let location=CGEvent(source:nil)?.location {
             let start=CGPoint(x:min(1,max(0,(location.x-bounds.minX-1)/max(1,bounds.width-2))),y:min(1,max(0,(location.y-bounds.minY-1)/max(1,bounds.height-2))))
-            let now=ProcessInfo.processInfo.systemUptime
-            cursor.with{$0.place(start,at:now);$0.reset()}
+            cursor.with{$0.place(start)}
         }
         changed()
     }
@@ -1059,35 +1084,50 @@ final class ClosedCaseSession: NSObject {
         guard let bias=result["bias"] as? [Double],bias.count==3 else{return}
         let offset=SIMD3(bias[0],bias[1],bias[2])
         let gyro=rows.filter{$0[1]==12}.sorted{$0[2]<$1[2]}
-        if flickLearner != nil{
+        if flickTeacher != nil{
             for row in gyro{
-                for event in flickLearner?.feed(stamp:row[2],w:SIMD3(row[4],row[5],row[6])*1e-5-offset) ?? []{
-                    try? log?.write(contentsOf:Data("FLICKLEARN \(event)\n".utf8))
-                    if case .learned=event{flickLearner=nil}else if case .failed=event{flickLearner=nil}
-                    onFlickLearning?(event)
+                for event in flickTeacher?.feed(stamp:row[2],w:SIMD3(row[4],row[5],row[6])*1e-5-offset) ?? []{
+                    try? log?.write(contentsOf:Data("FLICKTEACH \(event)\n".utf8))
+                    if case .learned=event{flickTeacher=nil}else if case .failed=event{flickTeacher=nil}
+                    onFlickTeaching?(event)
                 }
             }
             return
         }
-        func edge(_ key:String)->SIMD3<Double>?{(result[key] as? [Double]).flatMap{$0.count==3 ? SIMD3($0[0],$0[1],$0[2]):nil}}
-        var flicks:[FlickAxis:ClosedCaseFlick]=[:]
-        for (axis,key) in [(FlickAxis.vertical,"up"),(.horizontal,"right")] where CaseGesture.flicks.contains(where:{$0.axis==axis && gestureActions[$0] ?? .nothing != .nothing}){
-            if let taught=taughtFlicks[axis]{flicks[axis]=taught}
-            else if let edge=edge(key){flicks[axis]=ClosedCaseFlick(axis:edge,peak:ClosedCaseFlickDetector.defaultPeak)}
+        let active=taughtFlicks.filter{gestureActions[$0.key] ?? .nothing != .nothing}
+        guard enabled,calibrated,tapHold==nil,!active.isEmpty else{
+            flickRecognizer.reset()
+            if flickHold != nil{flickHold=nil;anchorAt=nil;cursor.with{$0.glide(fromNext:true)}}
+            return
         }
-        guard enabled,calibrated,tapHold==nil,!flicks.isEmpty else{flickDetector.reset();return}
-        flickDetector.flicks=flicks
+        flickRecognizer.templates=active
+        // Where the pointer was just before `t`.
+        func point(before t:Double)->CGPoint{recentPoints.last{$0.t<t}?.point ?? smooth}
         for row in gyro{
-            for event in flickDetector.feed(stamp:row[2],w:SIMD3(row[4],row[5],row[6])*1e-5-offset){
-                guard case .flick(let axis,let turn,let since)=event,let gesture=closedCaseFlickGesture(axis,turn:turn,up:edge("up"),right:edge("right")) else{continue}
-                guard gestureActions[gesture] ?? .nothing != .nothing else{try? log?.write(contentsOf:Data("gesture: \(gesture.title), which does nothing\n".utf8));continue}
-                // The flick swung the pointer; it glides back to where it was, and holds there a moment.
-                let at=recentPoints.last{$0.t<since}?.point ?? smooth,now=ProcessInfo.processInfo.systemUptime
-                smooth=at;gestureHoldUntil=now+0.3;cursor.with{$0.move(to:at,at:now)}
-                performGesture(gesture,at:at)
+            for event in flickRecognizer.feed(stamp:row[2],w:SIMD3(row[4],row[5],row[6])*1e-5-offset){
+                switch event {
+                case .fast(let since):
+                    // Maybe a flick: the pointer holds where the fast turn began, and never shows the swing.
+                    let at=point(before:since);flickHold=at
+                    cursor.with{$0.rewrite(from:since,to:at,glide:false)}
+                case .flick(let gesture,let since,let distance):
+                    // Back to where it was before the flick, wind-up and all, and on from there for good.
+                    let at=point(before:since)
+                    try? log?.write(contentsOf:Data(String(format:"flick: %@, %.2f from what was taught\n",gesture.title,distance).utf8))
+                    flickHold=nil;gestureHoldAt=at;gestureHoldUntil=row[2]*1e-6+Self.afterFlick;anchorAt=at;anchorKeeps=true;smooth=at
+                    for index in recentPoints.indices where recentPoints[index].t>=since{recentPoints[index].point=at}
+                    cursor.with{$0.rewrite(from:since,to:at,glide:true)}
+                    performGesture(gesture,at:at)
+                case .none(_,let reason):
+                    try? log?.write(contentsOf:Data("flick: none, \(reason)\n".utf8))
+                    // Not a flick: the pointer glides on to the aim from the next sample.
+                    if flickHold != nil{flickHold=nil;anchorAt=nil;cursor.with{$0.glide(fromNext:true)}}
+                }
             }
         }
     }
+    // After a flick the pointer holds this long (s) while the hand settles.
+    private static let afterFlick=0.1
     // Says a gesture landed, as a tap's click does (the app shows it in the HUD).
     var onGesture:((CaseGesture,GestureAction)->Void)?
     private func performGesture(_ gesture:CaseGesture,at point:CGPoint){
@@ -1103,11 +1143,10 @@ final class ClosedCaseSession: NSObject {
         guard AXIsProcessTrusted(),let number=pointerScreen()?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else{return nil}
         return CGDisplayBounds(CGDirectDisplayID(number.uint32Value))
     }
-    // A click moves the system cursor to where it lands, so the glide carries on from there. How far that was
+    // A click moves the system cursor to where it lands, so the cursor carries on from there. How far that was
     // goes in the log: a few pixels at most, since a tap holds the cursor from the moment it's heard.
     private func placeCursor(at point:CGPoint,bounds:CGRect){
-        let now=ProcessInfo.processInfo.systemUptime
-        let was=cursor.with{glide->CGPoint? in let was=glide.shown;glide.place(point,at:now);return was}
+        let was=cursor.with{timeline->CGPoint? in let was=timeline.shown;timeline.place(point);return was}
         if let was{let a=screenPoint(was,bounds:bounds),b=screenPoint(point,bounds:bounds);try? log?.write(contentsOf:Data(String(format:"click: cursor %.0f px from where it landed\n",hypot(a.x-b.x,a.y-b.y)).utf8))}
     }
     private func postClick(_ point:CGPoint){

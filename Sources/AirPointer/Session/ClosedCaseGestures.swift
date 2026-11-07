@@ -2,8 +2,8 @@ import AppKit
 import Carbon
 
 // What the closed case can do besides point, each mapped in Settings ▸ Gestures: a tap (a click unless mapped
-// to something else), a double tap, and fast, big flicks up, down, left and right. All but the tap do nothing
-// until given an action.
+// to something else), a double tap, and flicks up, down, left and right, each taught by the person who flicks
+// it. All but the tap do nothing until given an action.
 enum CaseGesture:String,CaseIterable {
     case tap,doubleTap,flickUp,flickDown,flickLeft,flickRight
     var title:String {
@@ -12,262 +12,277 @@ enum CaseGesture:String,CaseIterable {
         case .flickUp:return "Flick up";case .flickDown:return "Flick down";case .flickLeft:return "Flick left";case .flickRight:return "Flick right"
         }
     }
+    // For buttons and sheet titles: "Teach Flick Up".
+    var name:String{title.split(separator:" ").map{$0.prefix(1).uppercased()+$0.dropFirst()}.joined(separator:" ")}
     var symbol:String {
         switch self {
         case .tap,.doubleTap:return "hand.tap"
         case .flickUp:return "arrow.up";case .flickDown:return "arrow.down";case .flickLeft:return "arrow.left";case .flickRight:return "arrow.right"
         }
     }
+    // The way a flick goes, for captions and the teaching sheet.
+    var way:String{switch self{case .flickUp:return "up";case .flickDown:return "down";case .flickLeft:return "left";case .flickRight:return "right";default:return ""}}
     // What it does with nothing chosen: a tap clicks, the rest do nothing.
     var standard:GestureAction{self == .tap ? .click:.nothing}
     static let flicks:[CaseGesture]=[.flickUp,.flickDown,.flickLeft,.flickRight]
-    var axis:FlickAxis?{switch self{case .flickUp,.flickDown:return .vertical;case .flickLeft,.flickRight:return .horizontal;default:return nil}}
 }
 
-// The two axes flicks swing about, each taught on its own. The raw values are what Settings saved when these
-// were the Yes nod and No shake, so what was taught then still counts.
-enum FlickAxis:String,CaseIterable {
-    case vertical="yes",horizontal="no"
-    var title:String{self == .vertical ? "Up and Down":"Left and Right"}
-    var movement:String {
-        self == .vertical ? "Flick the case up and back, or down and back, fast and big."
-            :"Flick the case left and back, or right and back, fast and big."
-    }
-    var other:FlickAxis{self == .vertical ? .horizontal:.vertical}
+// MARK: - Flicks
+
+private func length(_ v:SIMD3<Double>)->Double{(v*v).sum().squareRoot()}
+
+// One burst of turning: from just before the case turns at 60°/s or more until it has stayed under that for
+// 80 ms. A flick is one burst, but so is a quick aim, a tap or a fidget, which is why flicks are taught: each
+// person's flick has its own shape (a small wind-up the other way, a fast snap, a slower return, or a fast way
+// out and back), and one rule for everyone recognised under a third of real ones.
+struct ClosedCaseBurst {
+    var samples:[(t:Double,w:SIMD3<Double>)]
+    // Longer than any flick: never one.
+    var long=false
+    var since:Double{samples.first?.t ?? 0}
+    var duration:Double{(samples.last?.t ?? 0)-since}
+    var peak:Double{samples.map{length($0.w)}.max() ?? 0}
 }
 
-// One taught gesture: the axis the case swings about, in the case's own frame, and how fast its faster
-// swing has to be (°/s), kept between 300 and 340. Aiming never comes near 300°/s, so a higher bar adds no
-// safety and only misses everyday flicks, which are far gentler than eager taught ones (those reach
-// 1100°/s, everyday ones 370°/s). Teaching can lower the bar for a gentle hand, never raise it; bars saved
-// higher come back capped. The struct keeps the name it had when gestures were single flicks.
-struct ClosedCaseFlick:Equatable {
-    var axis:SIMD3<Double>,peak:Double
-    var stored:[Double]{[axis.x,axis.y,axis.z,peak]}
-    init(axis:SIMD3<Double>,peak:Double) {
-        let n=(axis*axis).sum().squareRoot();self.axis=n>0 ? axis/n:axis
-        self.peak=min(ClosedCaseFlickDetector.highestPeak,max(ClosedCaseFlickDetector.lowestPeak,peak))
-    }
-    init?(stored:[Double]?) {
-        guard let stored,stored.count==4,stored.allSatisfy(\.isFinite),stored[3]>0 else{return nil}
-        let axis=SIMD3(stored[0],stored[1],stored[2]);guard (axis*axis).sum()>0.25 else{return nil}
-        self.init(axis:axis,peak:stored[3])
-    }
-}
-
-// A flick is a fast, big swing and its return about the vertical or horizontal axis, once or several times (a
-// nod or a shake). Its direction is the first swing's: the session reads it against the calibrated up and
-// right. Each swing is measured along the axis. A pair of swings, one way then back, counts when the faster is fast
-// (340°/s untaught, or 70% of the person's own), the slower is at least 35% of it, both turn 15° or more and
-// one 30° or more, each lasts 50-600 ms, neither wanders off its axis, and the case was steady before the
-// first. The pair's own axis then has to match this gesture's clearly better than the other's, and only one
-// gesture counts until the case settles again. Aiming never swings that fast and that far back and forth:
-// over 56 s of recorded pointing and the recorded taps, nothing counts about any of 200 random axis pairs,
-// while the recorded natural nod and shake (Tests/GestureFixtures.csv) each count once.
-struct ClosedCaseFlickDetector {
-    // `turn` is the first swing's rotation, to tell up from down and left from right.
-    enum Event:Equatable{case flick(FlickAxis,turn:SIMD3<Double>,since:Double)}
-    // Rotation rates in degrees per second, angles in degrees, times in seconds.
-    // Tuned on real use: everyday flicks go out at 370–870°/s and come back at 20–45% of that, often
-    // starting while the hand still moves at up to 100°/s from the last one.
-    static let defaultPeak=340.0,lowestPeak=300.0,highestPeak=340.0,onset=40.0,calm=100.0,slowerShare=0.2
-    static let shortestSwing=0.05,longestSwing=0.6,smallestSwing=15.0,largeSwing=30.0,offAxisShare=0.65
-    static let alignment=0.7,margin=0.08,settle=0.2,settleBelow=80.0,fade=0.15,maximumGap=0.1
-    var flicks:[FlickAxis:ClosedCaseFlick]=[:]
-    struct Swing{var sign:Double,start:Double,end=0.0,peak:Double,angle=0.0,turn=SIMD3<Double>.zero,off:Double,quietSince:Double?=nil}
-    private struct Track{var swing:Swing?,previous:Swing?,steady=false}
-    private var tracks:[FlickAxis:Track]=[:],recent:[(t:Double,w:SIMD3<Double>)]=[],last:Double?
-    private var settling=false,quietSince:Double?
-
-    mutating func reset(){tracks=[:];recent=[];last=nil;settling=false;quietSince=nil}
-    private static func length(_ v:SIMD3<Double>)->Double{(v*v).sum().squareRoot()}
-    // Whether a pair of swings is fast, big and clean enough to be a gesture with this speed bar.
-    static func qualifies(_ first:Swing,_ second:Swing,secondLasted:Double,bar:Double)->Bool {
-        let faster=max(first.peak,second.peak),slower=min(first.peak,second.peak)
-        return faster>=bar && slower>=slowerShare*faster && (shortestSwing...longestSwing).contains(first.end-first.start) &&
-            secondLasted>=shortestSwing && min(first.angle,second.angle)>=smallestSwing && max(first.angle,second.angle)>=largeSwing &&
-            first.off<=offAxisShare*first.peak && second.off<=offAxisShare*second.peak
-    }
-    // `w` has the gyro's resting offset taken out; `stamp` is the sensor's microseconds.
-    mutating func feed(stamp:Double,w:SIMD3<Double>)->[Event] {
-        let t=stamp*1e-6,speed=Self.length(w)
-        guard t.isFinite,w.x.isFinite,w.y.isFinite,w.z.isFinite else{return []}
-        if let last,t<=last{return []}
-        let dt=last.map{t-$0} ?? 0
-        if dt>Self.maximumGap{tracks=[:]}
+struct ClosedCaseBurstCutter {
+    static let onset=60.0,preroll=0.04,quietFor=0.08,longest=1.2,maximumGap=0.1,rise=120.0
+    // The burst so far, or the moment before one.
+    private(set) var samples:[(t:Double,w:SIMD3<Double>)]=[]
+    private(set) var active=false,peak=0.0
+    // When the speed last rose past 120°/s: where a fast part began.
+    private(set) var rose:Double?
+    private var last:Double?,quietSince:Double?,below=true,long=false
+    mutating func reset(){self=ClosedCaseBurstCutter()}
+    // `w` has the gyro's resting offset taken out (°/s); `t` is in seconds. A burst comes back once it has ended.
+    mutating func feed(t:Double,w:SIMD3<Double>)->ClosedCaseBurst? {
+        guard t.isFinite,w.x.isFinite,w.y.isFinite,w.z.isFinite else{return nil}
+        if let last,t<=last{return nil}
+        if let last,t-last>Self.maximumGap{reset()}
         last=t
-        defer{recent.append((t,w));while let first=recent.first,t-first.t>0.3{recent.removeFirst()}}
-        if speed<Self.settleBelow{quietSince=quietSince ?? t}else{quietSince=nil}
-        if settling {
-            guard let quietSince,t-quietSince>=Self.settle else{return []}
-            settling=false;tracks=[:]
+        let speed=length(w)
+        if speed<Self.rise{below=true}else if below{below=false;rose=t}
+        guard active else{
+            samples.append((t,w));while let first=samples.first,t-first.t>Self.preroll{samples.removeFirst()}
+            if speed>=Self.onset{active=true;peak=speed;quietSince=nil;long=false}
+            return nil
         }
-        for gesture in FlickAxis.allCases {
-            guard let flick=flicks[gesture] else{continue}
-            var k=tracks[gesture] ?? Track()
-            let s=(w*flick.axis).sum(),off=Self.length(w-flick.axis*s)
-            guard var swing=k.swing else{
-                if abs(s)>=Self.onset {
-                    let before=recent.filter{$0.t>=t-0.25 && $0.t<=t-0.05}.map{Self.length($0.w)}
-                    k.steady=(before.max() ?? .infinity)<=Self.calm
-                    k.swing=Swing(sign:s>0 ? 1:-1,start:t,peak:abs(s),off:off);k.previous=nil
-                }
-                tracks[gesture]=k;continue
+        if !long{samples.append((t,w))}
+        peak=max(peak,speed)
+        if let first=samples.first,t-first.t>Self.longest{long=true}
+        guard speed<Self.onset else{quietSince=nil;return nil}
+        quietSince=quietSince ?? t
+        guard let quietSince,t-quietSince>=Self.quietFor else{return nil}
+        var burst=samples
+        while burst.count>2,let end=burst.last,length(end.w)<Self.onset{burst.removeLast()}
+        let ended=ClosedCaseBurst(samples:burst,long:long)
+        active=false;samples=[];peak=0;self.quietSince=nil;long=false
+        return ended
+    }
+}
+
+// One example of a flick: its burst evenly resampled to 24 points and divided by its peak, so a quicker or
+// gentler flick of the same shape matches; its peak and length are kept to judge speed and size apart.
+struct ClosedCaseFlickExample:Equatable {
+    static let points=24
+    var shape:[SIMD3<Double>],peak:Double,duration:Double
+    init?(_ burst:ClosedCaseBurst) {
+        let samples=burst.samples,peak=burst.peak
+        guard samples.count>=2,peak>0,burst.duration>0 else{return nil}
+        let start=burst.since,span=burst.duration
+        var shape:[SIMD3<Double>]=[],j=0
+        for k in 0..<Self.points {
+            let t=start+span*Double(k)/Double(Self.points-1)
+            while j<samples.count-2,samples[j+1].t<t{j+=1}
+            let a=samples[j],b=samples[j+1],u=b.t<=a.t ? 0:min(1,max(0,(t-a.t)/(b.t-a.t)))
+            shape.append((a.w+(b.w-a.w)*u)/peak)
+        }
+        self.shape=shape;self.peak=peak;self.duration=span
+    }
+    init(shape:[SIMD3<Double>],peak:Double,duration:Double){self.shape=shape;self.peak=peak;self.duration=duration}
+    // Saved as peak, length, then the points' x, y and z.
+    var stored:[Double]{[peak,duration]+shape.flatMap{[$0.x,$0.y,$0.z]}}
+    init?(stored:[Double]) {
+        guard stored.count==2+3*Self.points,stored.allSatisfy(\.isFinite),stored[0]>0,stored[1]>0 else{return nil}
+        peak=stored[0];duration=stored[1]
+        shape=(0..<Self.points).map{SIMD3(stored[2+3*$0],stored[3+3*$0],stored[4+3*$0])}
+    }
+    // Dynamic time warping: the mean gap between the two shapes along the best way of lining them up, each point
+    // matched within 30% of the length of where it'd be. 0 is the same shape; the person's own flicks of one kind
+    // come out 0.1–0.2 apart, other flicks and aiming 0.3 or more.
+    static func distance(_ a:[SIMD3<Double>],_ b:[SIMD3<Double>])->Double {
+        let n=a.count,m=b.count
+        guard n>0,m>0 else{return .infinity}
+        let band=max(Int((0.3*Double(max(n,m))).rounded()),abs(n-m)),width=m+1
+        var cost=[Double](repeating:.infinity,count:(n+1)*width),steps=[Int](repeating:0,count:(n+1)*width)
+        cost[0]=0
+        for i in 1...n {
+            let low=max(1,i-band),high=min(m,i+band)
+            guard low<=high else{continue}
+            for j in low...high {
+                var best=cost[(i-1)*width+j-1],count=steps[(i-1)*width+j-1]
+                for (c,s) in [(cost[(i-1)*width+j],steps[(i-1)*width+j]),(cost[i*width+j-1],steps[i*width+j-1])] where c<best || (c==best && s<count){best=c;count=s}
+                cost[i*width+j]=best+length(a[i-1]-b[j-1]);steps[i*width+j]=count+1
             }
-            if swing.sign*s <= -Self.onset {
-                swing.end=t;k.previous=swing
-                swing=Swing(sign:-swing.sign,start:t,peak:abs(s),off:off)
-            } else if abs(s)<Self.onset {
-                swing.quietSince=swing.quietSince ?? t
-                if t-(swing.quietSince ?? t)>Self.fade{tracks[gesture]=Track();continue}
-            } else{swing.quietSince=nil}
-            if swing.sign*s>0{swing.peak=max(swing.peak,abs(s));swing.angle+=abs(s)*dt;swing.turn+=w*dt;swing.off=max(swing.off,off)}
-            k.swing=swing;tracks[gesture]=k
-            guard k.steady,let previous=k.previous,Self.qualifies(previous,swing,secondLasted:t-swing.start,bar:flick.peak) else{continue}
-            // The pair's own axis decides between Yes and No.
-            let pair=previous.turn-swing.turn,n=Self.length(pair)
-            guard n>0 else{continue}
-            let scores=flicks.map{(gesture:$0.key,fit:abs(($0.value.axis*pair).sum())/n)}.sorted{$0.fit>$1.fit}
-            guard scores[0].gesture==gesture,scores[0].fit>=Self.alignment,scores[0].fit-(scores.count>1 ? scores[1].fit:0)>=Self.margin else{continue}
-            settling=true;quietSince=nil;tracks=[:]
-            return [.flick(gesture,turn:previous.turn,since:previous.start)]
         }
-        return []
+        let end=n*width+m
+        return steps[end]>0 ? cost[end]/Double(steps[end]):.infinity
     }
 }
 
-// Which flick a detected one is: up or down along the calibrated up, left or right along the calibrated right.
-func closedCaseFlickGesture(_ axis:FlickAxis,turn:SIMD3<Double>,up:SIMD3<Double>?,right:SIMD3<Double>?)->CaseGesture? {
-    let reference=axis == .vertical ? up:right
-    guard let reference else{return nil}
-    let along=(turn*reference).sum()
-    guard along != 0 else{return nil}
-    return axis == .vertical ? (along>0 ? .flickUp:.flickDown):(along>0 ? .flickRight:.flickLeft)
+// A taught flick: the person's examples, how fast a burst must be to be one (55% of their gentlest, and at
+// least 200°/s; aiming rarely turns faster), how long (half the shortest to twice the longest), and how close
+// its shape must come to one of them: 1.5 times as far as the examples are from each other, between 0.18 and
+// 0.28.
+struct ClosedCaseFlickTemplate:Equatable {
+    static let lowestTrigger=200.0,triggerShare=0.55,closest=0.18,farthest=0.28,spread=1.5
+    let examples:[ClosedCaseFlickExample],reach:Double
+    init?(examples:[ClosedCaseFlickExample]) {
+        guard examples.count>=2 else{return nil}
+        let nearest=examples.indices.map{i in examples.indices.filter{$0 != i}.map{ClosedCaseFlickExample.distance(examples[i].shape,examples[$0].shape)}.min() ?? .infinity}
+        guard let widest=nearest.max(),widest.isFinite else{return nil}
+        self.examples=examples;reach=min(Self.farthest,max(Self.closest,Self.spread*widest))
+    }
+    var trigger:Double{max(Self.lowestTrigger,Self.triggerShare*(examples.map(\.peak).min() ?? 0))}
+    var durations:ClosedRange<Double>{0.5*(examples.map(\.duration).min() ?? 0)...2*(examples.map(\.duration).max() ?? 0)}
+    func distance(_ example:ClosedCaseFlickExample)->Double{examples.map{ClosedCaseFlickExample.distance(example.shape,$0.shape)}.min() ?? .infinity}
+    func fits(_ example:ClosedCaseFlickExample)->Bool{example.peak>=trigger && durations.contains(example.duration)}
+    var stored:[[Double]]{examples.map(\.stored)}
+    init?(stored:[[Double]]?) {
+        guard let stored else{return nil}
+        let examples=stored.compactMap{ClosedCaseFlickExample(stored:$0)}
+        guard examples.count==stored.count else{return nil}
+        self.init(examples:examples)
+    }
 }
 
-// Learns a gesture from three of its swing pairs that agree, without knowing its axis first. A burst runs
-// from a steady moment until the case settles; its axis is the one it turned about most; every pair of swings
-// along that axis that is fast and big (judged with a bar of 250°/s) is one example, so a natural "yes, yes,
-// yes" teaches it at once, and nods with pauses between do too. The dots fill while the person nods. Nods
-// up-first or down-first are one axis. The speed then needed is 70% of the typical faster swing, kept
-// between 300 and 340°/s. A burst that swings clearly but too gently says so.
-struct ClosedCaseFlickLearner {
-    enum Event:Equatable{case flick(agreeing:Int,total:Int),tooSlow,learned(ClosedCaseFlick),failed}
-    static let flicks=3,mostFlicks=10,agree=0.85,learningBar=250.0,peakShare=0.7,longestBurst=4.0,checkEvery=0.15
-    private typealias Detector=ClosedCaseFlickDetector
-    struct Example{var axis:SIMD3<Double>,peak:Double}
-    private var burst:[(t:Double,w:SIMD3<Double>)]=[],recent:[(t:Double,w:SIMD3<Double>)]=[],last:Double?,quietSince:Double?,steady=false
-    private var examples:[Example]=[],live:[Example]=[],heard=0,checkedAt=0.0,done=false
-
-    private static func length(_ v:SIMD3<Double>)->Double{(v*v).sum().squareRoot()}
+// Finds taught flicks in the gyro. While a burst turns faster than 300°/s (or the gentlest taught flick's bar,
+// if higher) it says so, so the pointer can hold still through what may be a flick; once the burst ends it is
+// the flick whose shape it comes closest to, if it's fast and long enough for that flick, within its reach,
+// and clearly closer to it than to any other (at most 80% as far). Over 56 s of recorded pointing, 21 s of
+// holding and the recorded lid closes, nothing counts.
+struct ClosedCaseFlickRecognizer {
+    enum Event:Equatable{case fast(since:Double),flick(CaseGesture,since:Double,distance:Double),none(since:Double,reason:String)}
+    static let holdSpeed=300.0,clearly=0.8,shortest=0.08
+    var templates:[CaseGesture:ClosedCaseFlickTemplate]=[:]
+    private var cutter=ClosedCaseBurstCutter(),warned=false
+    mutating func reset(){cutter.reset();warned=false}
+    private var holdAbove:Double{max(Self.holdSpeed,templates.values.map(\.trigger).min() ?? Self.holdSpeed)}
+    // `stamp` is the sensor's microseconds.
     mutating func feed(stamp:Double,w:SIMD3<Double>)->[Event] {
-        let t=stamp*1e-6,speed=Self.length(w)
-        guard !done,t.isFinite,w.x.isFinite,w.y.isFinite,w.z.isFinite else{return []}
-        if let last,t<=last{return []}
-        last=t
-        defer{recent.append((t,w));while let first=recent.first,t-first.t>0.3{recent.removeFirst()}}
-        if speed>=Detector.onset {
-            quietSince=nil
-            if burst.isEmpty{steady=(recent.filter{$0.t>=t-0.25 && $0.t<=t-0.05}.map{Self.length($0.w)}.max() ?? .infinity)<=Detector.calm;checkedAt=t}
-            burst.append((t,w))
-            if let first=burst.first,t-first.t>Self.longestBurst{return finishBurst()}
-            // While the burst goes on, every so often: the pairs so far, so the dots fill as the person nods.
-            if t-checkedAt>=Self.checkEvery{checkedAt=t;return update()}
-            return []
-        }
-        guard !burst.isEmpty else{return []}
-        burst.append((t,w));quietSince=quietSince ?? t
-        return t-(quietSince ?? t)>=Detector.settle ? finishBurst():[]
-    }
-    // The axis a burst turned about most: the largest eigenvector of the sum of w·wᵀ.
-    static func principalAxis(_ samples:[SIMD3<Double>])->SIMD3<Double>? {
-        var m=[SIMD3<Double>](repeating:.zero,count:3)
-        for w in samples{m[0]+=w*w.x;m[1]+=w*w.y;m[2]+=w*w.z}
-        var v=SIMD3(1.0,0.7,0.3)
-        for _ in 0..<60 {
-            let next=SIMD3((m[0]*v).sum(),(m[1]*v).sum(),(m[2]*v).sum()),n=length(next)
-            guard n>0 else{return nil}
-            v=next/n
-        }
-        return v
-    }
-    // Every fast, big pair of swings along `axis`, one after another without sharing a swing.
-    static func pairs(_ samples:[(t:Double,w:SIMD3<Double>)],axis:SIMD3<Double>,bar:Double)->[Example] {
-        typealias Swing=ClosedCaseFlickDetector.Swing
-        var swings:[Swing]=[],current:Swing?,last:Double?
-        for (t,w) in samples {
-            let dt=last.map{t-$0} ?? 0;last=t
-            let s=(w*axis).sum(),off=length(w-axis*s)
-            if var swing=current {
-                if swing.sign*s <= -Detector.onset{swing.end=t;swings.append(swing);current=Swing(sign:-swing.sign,start:t,peak:abs(s),off:off);continue}
-                if swing.sign*s>0{swing.peak=max(swing.peak,abs(s));swing.angle+=abs(s)*dt;swing.turn+=w*dt;swing.off=max(swing.off,off)}
-                current=swing
-            } else if abs(s)>=Detector.onset{current=Swing(sign:s>0 ? 1:-1,start:t,peak:abs(s),off:off)}
-        }
-        if var swing=current{swing.end=last ?? swing.start;swings.append(swing)}
-        var found:[Example]=[],index=0
-        while index+1<swings.count {
-            let first=swings[index],second=swings[index+1]
-            if Detector.qualifies(first,second,secondLasted:second.end-second.start,bar:bar) {
-                let turn=first.turn-second.turn,n=length(turn)
-                if n>0{found.append(Example(axis:turn/n,peak:max(first.peak,second.peak)))}
-                index+=2
-            } else{index+=1}
-        }
-        return found
-    }
-    // The examples that share an axis (either way round) with the best-supported one.
-    static func agreeing(_ examples:[Example])->[Example] {
-        let axes=examples.map(\.axis)
-        guard let seed=axes.max(by:{a,b in axes.filter{abs(($0*a).sum())>=agree}.count<axes.filter{abs(($0*b).sum())>=agree}.count}) else{return []}
-        return examples.filter{abs(($0.axis*seed).sum())>=agree}.map{(($0.axis*seed).sum()<0) ? Example(axis:-$0.axis,peak:$0.peak):$0}
-    }
-    private mutating func update()->[Event] {
-        live=steady ? Self.principalAxis(burst.map(\.w)).map{Self.pairs(burst,axis:$0,bar:Self.learningBar)} ?? []:[]
-        let all=examples+live,members=Self.agreeing(all)
+        guard !templates.isEmpty else{return []}
         var events:[Event]=[]
-        if members.count>heard{heard=members.count;events.append(.flick(agreeing:members.count,total:all.count))}
-        if members.count>=Self.flicks {
-            let peaks=members.map(\.peak).sorted(),typical=peaks[peaks.count/2],sum=members.reduce(SIMD3<Double>.zero){$0+$1.axis}
-            done=true;events.append(.learned(ClosedCaseFlick(axis:sum,peak:typical*Self.peakShare)))
-        } else if all.count>=Self.mostFlicks{done=true;events.append(.failed)}
+        let ended=cutter.feed(t:stamp*1e-6,w:w)
+        if cutter.active,!warned,cutter.peak>=holdAbove{warned=true;events.append(.fast(since:cutter.rose ?? cutter.samples.first?.t ?? stamp*1e-6))}
+        guard let burst=ended else{return events}
+        let held=warned;warned=false
+        guard held || burst.peak>=(templates.values.map(\.trigger).min() ?? .infinity) else{return events}
+        let found=Self.match(burst,among:templates)
+        if let gesture=found.gesture{events.append(.flick(gesture,since:burst.since,distance:found.distance))}
+        else{events.append(.none(since:burst.since,reason:found.reason))}
         return events
     }
-    private mutating func finishBurst()->[Event] {
-        defer{burst=[];live=[];quietSince=nil}
-        var events=update()
-        guard !done else{return events}
-        if live.isEmpty,let axis=Self.principalAxis(burst.map(\.w)),(burst.map{abs(($0.w*axis).sum())}.max() ?? 0)>=120{events.append(.tooSlow)}
-        examples+=live
-        return events
+    // The taught flick a burst is, with how far its shape was from it, or why it's none. With `anySpeed`, as
+    // when teaching another flick, only the shape counts.
+    static func match(_ burst:ClosedCaseBurst,among templates:[CaseGesture:ClosedCaseFlickTemplate],anySpeed:Bool=false)->(gesture:CaseGesture?,distance:Double,reason:String) {
+        if burst.long{return (nil,.infinity,"longer than \(ClosedCaseBurstCutter.longest) s")}
+        guard burst.duration>=shortest,let example=ClosedCaseFlickExample(burst) else{return (nil,.infinity,String(format:"too short, %.2f s",burst.duration))}
+        let distances=templates.map{(gesture:$0.key,distance:$0.value.distance(example))}.sorted{$0.distance<$1.distance}
+        guard let best=distances.first(where:{anySpeed || templates[$0.gesture]?.fits(example)==true}),let template=templates[best.gesture] else{
+            return (nil,distances.first?.distance ?? .infinity,String(format:"too slow or the wrong length for any flick: %.0f°/s, %.2f s",example.peak,example.duration))
+        }
+        if best.distance>template.reach{return (nil,best.distance,String(format:"%@ but not close enough, %.2f (reach %.2f)",best.gesture.title,best.distance,template.reach))}
+        if let other=distances.first(where:{$0.gesture != best.gesture}),best.distance>Self.clearly*other.distance {
+            return (nil,best.distance,String(format:"between %@ (%.2f) and %@ (%.2f)",best.gesture.title,best.distance,other.gesture.title,other.distance))
+        }
+        return (best.gesture,best.distance,"")
     }
 }
 
-// Keeps the pointer where a click or a flick left it. A tap or a flick turns the case a few degrees (a tap
-// about 5°, some 200 px), so once the pointer is let go it would jump to where the case now points. Instead the
-// difference is kept as an offset that fades only as the person moves: half as fast as the pointer moves, so
-// it's gone once they've moved twice as far, and never while they hold still. Pointing past a screen edge, where
-// the aim can't move further, it fades over about a second, so every edge stays reachable.
+// Teaching one flick: four bursts that agree (each within 0.35 of another, all linked) make it. Each burst
+// that joins the largest agreeing group fills a dot; one that doesn't says so. A burst too gentle (under
+// 200°/s), too long, or shaped like another taught flick doesn't count. After 12 bursts without four
+// agreeing, it gives up.
+struct ClosedCaseFlickTeacher {
+    enum Event:Equatable{case heard(Int),tooSlow,tooLong,different,sameAs(CaseGesture),learned(ClosedCaseFlickTemplate),failed}
+    static let flicks=4,mostTries=12,agree=0.35,bar=200.0,gentle=100.0,kept=6
+    let gesture:CaseGesture,others:[CaseGesture:ClosedCaseFlickTemplate]
+    private var cutter=ClosedCaseBurstCutter(),candidates:[ClosedCaseFlickExample]=[],heard=0,done=false
+    init(gesture:CaseGesture,others:[CaseGesture:ClosedCaseFlickTemplate]=[:]){self.gesture=gesture;self.others=others.filter{$0.key != gesture}}
+    mutating func feed(stamp:Double,w:SIMD3<Double>)->[Event] {
+        guard !done,let burst=cutter.feed(t:stamp*1e-6,w:w) else{return []}
+        guard burst.peak>=Self.bar else{return burst.peak>=Self.gentle ? [.tooSlow]:[]}
+        if burst.long{return [.tooLong]}
+        guard burst.duration>=ClosedCaseFlickRecognizer.shortest,let example=ClosedCaseFlickExample(burst) else{return []}
+        if !others.isEmpty,let same=ClosedCaseFlickRecognizer.match(burst,among:others,anySpeed:true).gesture{return [.sameAs(same)]}
+        candidates.append(example)
+        let group=Self.largestGroup(candidates)
+        var events:[Event]=[]
+        if group.count>heard{heard=group.count;events.append(.heard(heard))}else{events.append(.different)}
+        if group.count>=Self.flicks,let template=ClosedCaseFlickTemplate(examples:group.prefix(Self.kept).map{candidates[$0]}) {
+            done=true;events.append(.learned(template))
+        } else if candidates.count>=Self.mostTries{done=true;events.append(.failed)}
+        return events
+    }
+    // The largest set of examples linked by pairs within `agree`, in the order they came.
+    static func largestGroup(_ examples:[ClosedCaseFlickExample])->[Int] {
+        let n=examples.count
+        var near=[[Int]](repeating:[],count:n)
+        for i in 0..<n{for j in i+1..<max(i+1,n) where ClosedCaseFlickExample.distance(examples[i].shape,examples[j].shape)<=agree{near[i].append(j);near[j].append(i)}}
+        var seen=Set<Int>(),best:[Int]=[]
+        for i in 0..<n where !seen.contains(i) {
+            var group=[i],k=0;seen.insert(i)
+            while k<group.count{for j in near[group[k]] where !seen.contains(j){seen.insert(j);group.append(j)};k+=1}
+            if group.count>best.count{best=group.sorted()}
+        }
+        return best
+    }
+}
+
+// Keeps the pointer where a click or a flick left it, and every edge in reach. A tap turns the case a few
+// degrees (about 5°, some 200 px), so once the pointer is let go it would jump to where the case now points;
+// instead the difference is kept as an offset that fades only as the person moves, half as fast as the pointer
+// moves, so it's gone once they've moved twice as far, and never while they hold still. A flick's turn is
+// another matter: the gyro loses track of some of it (Bluetooth drops samples at 1000°/s), so after a flick
+// the pointer carries on from where it was, for good, rather than drift toward wherever the lost turn says.
+// That, and the gyro's slow drift, would leave an edge out of reach, so pushing past an edge at an aiming
+// pace moves the aim with it, as a mouse does at the edge of its pad; a fast swing past one doesn't, so a
+// quick turn out and back lands where it started. The pace is the fastest of the last moment (fading over
+// 0.2 s), since a swing stands still for an instant where it turns back.
 struct ClosedCasePointerAnchor {
-    static let catchUp=0.5,edgeFade=1.0,edge=0.001
-    private(set) var offset=CGVector.zero
-    private var last:CGPoint?,lastTime:Double?
-    // `aim` is where the case points now; the pointer stays at `point`.
-    mutating func anchor(_ aim:CGPoint,at point:CGPoint){offset=CGVector(dx:point.x-aim.x,dy:point.y-aim.y);last=aim}
-    mutating func reset(){offset = .zero;last=nil;lastTime=nil}
+    static let catchUp=0.5,slipBelow=1.0,slipAbove=3.0,paceFade=0.2
+    // `offset` fades as the person moves; `base` stays.
+    private(set) var offset=CGVector.zero,base=CGVector.zero
+    private var last:CGPoint?,lastTime:Double?,pace=Double.infinity
+    // `aim` is where the case points now; the pointer stays at `point`. `keep`: from now on, not fading.
+    mutating func anchor(_ aim:CGPoint,at point:CGPoint,keep:Bool=false) {
+        if keep{base=CGVector(dx:point.x-aim.x,dy:point.y-aim.y);offset = .zero}
+        else{offset=CGVector(dx:point.x-aim.x-base.dx,dy:point.y-aim.y-base.dy)}
+        last=aim
+    }
+    mutating func reset(){offset = .zero;base = .zero;last=nil;lastTime=nil;pace = .infinity}
+    // `aim` may lie past the screen's edges (0…1), where the case points beyond them; `time` in seconds.
     mutating func apply(_ aim:CGPoint,at time:Double)->CGPoint {
         defer{last=aim;lastTime=time}
-        let size=hypot(offset.dx,offset.dy)
-        if size>0,let last {
-            let keep=max(0,1-Self.catchUp*hypot(aim.x-last.x,aim.y-last.y)/size)
-            offset.dx*=keep;offset.dy*=keep
-            if let lastTime,time>lastTime {
-                let fade=exp(-(time-lastTime)/Self.edgeFade)
-                if (aim.x<=Self.edge && offset.dx>0) || (aim.x>=1-Self.edge && offset.dx<0){offset.dx*=fade}
-                if (aim.y<=Self.edge && offset.dy>0) || (aim.y>=1-Self.edge && offset.dy<0){offset.dy*=fade}
+        if let last {
+            let moved=hypot(aim.x-last.x,aim.y-last.y),size=hypot(offset.dx,offset.dy)
+            if size>0{let keep=max(0,1-Self.catchUp*moved/size);offset.dx*=keep;offset.dy*=keep}
+            if let lastTime,time>lastTime{
+                let speed=moved/(time-lastTime)
+                pace=pace.isFinite ? max(speed,pace*exp(-(time-lastTime)/Self.paceFade)):speed
             }
         }
-        return CGPoint(x:min(1,max(0,aim.x+offset.dx)),y:min(1,max(0,aim.y+offset.dy)))
+        // Past an edge: at an aiming pace (screens a second) all of the overshoot moves the aim, none when swinging fast.
+        let slip=min(1,max(0,(Self.slipAbove-pace)/(Self.slipAbove-Self.slipBelow)))
+        func slide(_ excess:Double,_ offset:inout CGFloat,_ base:inout CGFloat) {
+            var excess=excess*slip
+            guard excess != 0 else{return}
+            if offset*excess>0{let taken=abs(offset)<abs(excess) ? offset:excess;offset-=taken;excess-=taken}
+            base-=excess
+        }
+        let x=aim.x+base.dx+offset.dx,y=aim.y+base.dy+offset.dy
+        slide(x>1 ? x-1:x<0 ? x:0,&offset.dx,&base.dx)
+        slide(y>1 ? y-1:y<0 ? y:0,&offset.dy,&base.dy)
+        return CGPoint(x:min(1,max(0,aim.x+base.dx+offset.dx)),y:min(1,max(0,aim.y+base.dy+offset.dy)))
     }
 }
 
@@ -294,72 +309,98 @@ struct ClosedCaseDoubleTap {
     mutating func reset(){pending=nil}
 }
 
-// The cursor's own motion, one step per display refresh (ClosedCaseCursorOutput). Each step eases toward the
-// latest aim (20 ms) and carries it forward at its recent speed for up to 30 ms, so the bursts Bluetooth
-// delivers 20–60 ms apart read as one smooth movement. Nothing it does is a jump: when what it follows jumps
-// (a flick's return, recentering, the first aim once pointing starts), the gap fades over 180 ms, slow at
-// both ends, while the cursor keeps following live motion under it.
-struct ClosedCaseCursorGlide {
-    static let follow=0.02,lead=0.03,blend=0.18
-    // Where the cursor shows now, after the last step.
+// The cursor's own motion, one frame per display refresh (ClosedCaseCursorOutput). Bluetooth brings the gyro in
+// bursts, usually 20 ms apart but one gap in ten over 50 ms and some up to 150 ms, so a cursor that follows each
+// burst as it lands stalls and then lurches. Instead every sample's point goes on a track in the sensor's own
+// time, and each frame shows the track 40 ms behind the newest sample that could have arrived by then: what the
+// hand did, at the pace it did it. The Mac's clock less the sensor's is the least delay seen over the last 5 s,
+// eased so frames never skip or repeat. When a sample is later than 40 ms the track carries on at its recent
+// speed, for up to 60 ms; whatever that guessed wrong, and any point rewritten after it was shown (a tap holding
+// the pointer where it began), fades out over 60 ms. A deliberate change of course (a flick's return, a new
+// calibration, the first aim once pointing starts) glides over 180 ms, slow at both ends. On recorded pointing
+// that is half the frame-to-frame jerk of following bursts, and a fifth of the stalled frames.
+struct ClosedCaseCursorTimeline {
+    static let delay=0.04,ahead=0.06,settle=0.06,blend=0.18,keep=1.5,offsetSpan=5.0,speedSpan=0.05,ease=0.05
+    // Where the cursor shows now, after the last frame.
     private(set) var shown:CGPoint?
-    private var position:CGPoint?,target:CGPoint?,targetAt=0.0,velocity=CGVector.zero,steppedAt:Double?
-    private var carry=CGVector.zero,carryFrom=0.0,blendNext=false
-    mutating func aim(_ point:CGPoint,at now:Double) {
-        if blendNext{blendNext=false;move(to:point,at:now);return}
-        if let target,now>targetAt {
-            let dt=now-targetAt
-            if dt<0.15 {
-                let blend=min(1,dt/0.05)
-                velocity.dx+=((point.x-target.x)/dt-velocity.dx)*blend
-                velocity.dy+=((point.y-target.y)/dt-velocity.dy)*blend
-            } else{velocity = .zero}
+    private var track:[(t:Double,point:CGPoint)]=[],offsets:[(host:Double,offset:Double)]=[]
+    private var offset:Double?,lastFrame:Double?,lastS:Double?,lastTarget:CGPoint?
+    private var carry=CGVector.zero,blendCarry=CGVector.zero,blendFrom = -Double.infinity,blendNext=false,blendAt:Double?,blendOnAdd=false
+    // `t` is the sample's sensor time and `host` when it arrived, both in seconds.
+    mutating func add(_ point:CGPoint,at t:Double,arrived host:Double) {
+        guard point.x.isFinite,point.y.isFinite,t.isFinite,host.isFinite,t>(track.last?.t ?? -.infinity) else{return}
+        // A glide from the next sample starts as soon as the frame passes the one before, so no part of the step shows.
+        if blendOnAdd{blendOnAdd=false;blendAt=track.last?.t ?? t}
+        track.append((t,point))
+        let lag=host-t
+        while let newest=offsets.last,newest.offset>=lag{offsets.removeLast()}
+        offsets.append((host,lag))
+        while offsets.count>1,let oldest=offsets.first,host-oldest.host>Self.offsetSpan{offsets.removeFirst()}
+        if let first=track.first,t-first.t>2*Self.keep{track.removeFirst(track.firstIndex{t-$0.t<=Self.keep} ?? 0)}
+    }
+    // Every point from `t` on is `point` now: a hold heard after it began. `glide`: go there over 180 ms.
+    mutating func rewrite(from t:Double,to point:CGPoint,glide:Bool) {
+        var index=track.count-1
+        while index>=0,track[index].t>=t{track[index].point=point;index-=1}
+        if glide{blendNext=true}
+    }
+    // The next frame glides from where the cursor shows to the track; `fromNext`: once the next sample added shows.
+    mutating func glide(fromNext:Bool=false){if fromNext{blendOnAdd=true}else{blendNext=true}}
+    // What's on the track no longer holds (recentering, a new calibration): the new track glides in.
+    mutating func reset(){track=[];lastS=nil;lastTarget=nil;carry = .zero;blendNext=true}
+    // The cursor is at `point` (where pointing starts from, where a click put it): it glides on from there.
+    mutating func place(_ point:CGPoint){shown=point;blendNext=true}
+    private func estimate(_ s:Double)->CGPoint? {
+        guard let newest=track.last,let oldest=track.first else{return nil}
+        if s<=oldest.t{return oldest.point}
+        if s<=newest.t {
+            var low=0,high=track.count-1
+            while high-low>1{let mid=(low+high)/2;if track[mid].t<s{low=mid}else{high=mid}}
+            let a=track[low],b=track[high],u=b.t>a.t ? (s-a.t)/(b.t-a.t):1
+            return CGPoint(x:a.point.x+(b.point.x-a.point.x)*u,y:a.point.y+(b.point.y-a.point.y)*u)
         }
-        target=point;targetAt=now
+        let from=track.last{newest.t-$0.t>=Self.speedSpan} ?? oldest
+        guard newest.t>from.t else{return newest.point}
+        let ahead=min(s-newest.t,Self.ahead)/(newest.t-from.t)
+        return CGPoint(x:newest.point.x+(newest.point.x-from.point.x)*ahead,y:newest.point.y+(newest.point.y-from.point.y)*ahead)
     }
-    // Stay at `point`, as a click does: the cursor eases there and stays put.
-    mutating func hold(_ point:CGPoint,at now:Double){target=point;targetAt=now;velocity = .zero}
-    // Go to `point` without jumping: the gap from where the cursor shows fades over `blend`.
-    mutating func move(to point:CGPoint,at now:Double) {
-        let from=shown ?? point
-        position=point;target=point;targetAt=now;velocity = .zero;steppedAt=now
-        carry=CGVector(dx:from.x-point.x,dy:from.y-point.y);carryFrom=now
-    }
-    // The cursor is at `point` already: where pointing starts from, or where a click put it.
-    mutating func place(_ point:CGPoint,at now:Double){position=point;shown=point;target=point;targetAt=now;velocity = .zero;steppedAt=now;carry = .zero}
-    // What it follows is about to jump (recentering, a new calibration): the next aim glides there.
-    mutating func reset(){velocity = .zero;blendNext=true}
     mutating func step(at now:Double)->CGPoint? {
-        guard let target else{return nil}
-        let ahead=min(max(now-targetAt,0),Self.lead)
-        let goal=CGPoint(x:min(1,max(0,target.x+velocity.dx*ahead)),y:min(1,max(0,target.y+velocity.dy*ahead)))
-        var next=goal
-        if let position,let steppedAt {
-            let alpha=1-exp(-max(0,now-steppedAt)/Self.follow)
-            next=CGPoint(x:position.x+(goal.x-position.x)*alpha,y:position.y+(goal.y-position.y)*alpha)
+        guard let floor=offsets.first?.offset else{return shown}
+        let dt=lastFrame.map{max(0,now-$0)} ?? 0
+        let eased=offset.map{$0+max(-Self.ease*dt,min(Self.ease*dt,floor-$0))} ?? floor
+        offset=eased
+        let s=now-eased-Self.delay
+        guard let target=estimate(s) else{return shown}
+        let fade=exp(-dt/Self.settle)
+        if let blendAt,s>=blendAt{self.blendAt=nil;blendNext=true}
+        if blendNext {
+            blendNext=false
+            carry=CGVector(dx:carry.dx*fade,dy:carry.dy*fade)
+            let from=shown ?? target
+            blendCarry=CGVector(dx:from.x-target.x-carry.dx,dy:from.y-target.y-carry.dy);blendFrom=now
+        } else if let lastS,let lastTarget,let redo=estimate(lastS) {
+            carry=CGVector(dx:(carry.dx+lastTarget.x-redo.x)*fade,dy:(carry.dy+lastTarget.y-redo.y)*fade)
         }
-        position=next;steppedAt=now
-        // Smoothstep: the gap starts and ends fading at no speed, so the cursor's speed never jumps either.
-        let u=min(1,max(0,(now-carryFrom)/Self.blend)),left=1-u*u*(3-2*u)
-        if u>=1{carry = .zero}
-        let out=CGPoint(x:min(1,max(0,next.x+carry.dx*left)),y:min(1,max(0,next.y+carry.dy*left)))
-        shown=out
+        let u=min(1,max(0,(now-blendFrom)/Self.blend)),left=1-u*u*(3-2*u)
+        if u>=1{blendCarry = .zero}
+        let out=CGPoint(x:min(1,max(0,target.x+carry.dx+blendCarry.dx*left)),y:min(1,max(0,target.y+carry.dy+blendCarry.dy*left)))
+        shown=out;lastS=s;lastTarget=target;lastFrame=now
         return out
     }
 }
 
 // Moves the cursor once per refresh of the pointer's display (60 Hz here, 120 Hz on ProMotion), from a display
-// link on its own thread, so a busy main thread never holds it up and every frame shows one more step of the
-// glide. The session aims it from the main thread; the lock keeps the two apart. Without a display link, the
+// link on its own thread, so a busy main thread never holds it up and every frame shows one more frame of the
+// timeline. The session adds to it from the main thread; the lock keeps the two apart. Without a display link, the
 // session's 5 ms timer steps it instead.
 final class ClosedCaseCursorOutput:NSObject {
     private let lock=NSLock()
-    private var glide=ClosedCaseCursorGlide(),bounds:CGRect?,postUntil=0.0
+    private var timeline=ClosedCaseCursorTimeline(),bounds:CGRect?,postUntil=0.0
     private var link:CADisplayLink?,display:CGDirectDisplayID?,loop:RunLoop?,frameCount=0
     var linked:Bool{link != nil}
     // Frames stepped so far, for the session log's rate.
     var frames:Int{lock.lock();defer{lock.unlock()};return frameCount}
-    func with<T>(_ body:(inout ClosedCaseCursorGlide)->T)->T{lock.lock();defer{lock.unlock()};return body(&glide)}
+    func with<T>(_ body:(inout ClosedCaseCursorTimeline)->T)->T{lock.lock();defer{lock.unlock()};return body(&timeline)}
     var shown:CGPoint?{with{$0.shown}}
     // Main thread, every tick: which screen, where it is, and until when to move the cursor (nil bounds: don't).
     func configure(screen:NSScreen?,bounds:CGRect?,postUntil:Double) {
@@ -387,10 +428,10 @@ final class ClosedCaseCursorOutput:NSObject {
         return found
     }
     @objc private func refresh(_ link:CADisplayLink){frame(at:ProcessInfo.processInfo.systemUptime)}
-    // One step of the glide, posted as a mouse move.
+    // One frame of the timeline, posted as a mouse move.
     func frame(at now:Double) {
         lock.lock()
-        let point=glide.step(at:now),post=now<postUntil ? bounds:nil
+        let point=timeline.step(at:now),post=now<postUntil ? bounds:nil
         frameCount+=1
         lock.unlock()
         if let point,let post{CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:screenPoint(point,bounds:post),mouseButton:.left)?.post(tap:.cghidEventTap)}
@@ -504,117 +545,97 @@ enum GestureAction:Equatable {
 // MARK: - Checks
 
 func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
-    func length(_ v:SIMD3<Double>)->Double{(v*v).sum().squareRoot()}
     typealias Plan=(start:Double,axis:SIMD3<Double>,peak:Double,half:Double)
     // Gyro at 200 Hz: each planned swing is half a sine of that peak and length about its axis; still otherwise.
-    func motion(_ seconds:Double,_ plan:[Plan],drift:SIMD3<Double> = .zero)->[(Double,SIMD3<Double>)] {
+    func motion(_ seconds:Double,_ plan:[Plan])->[(Double,SIMD3<Double>)] {
         (0..<Int(seconds*200)).map{i in
             let t=Double(i)*0.005
-            var w=drift
+            var w=SIMD3<Double>.zero
             for swing in plan where t>=swing.start && t<=swing.start+swing.half{w+=swing.axis*(swing.peak*sin(Double.pi*(t-swing.start)/swing.half))}
             return (1e9+t*1e6,w)
         }
     }
-    // A nod: fast one way, slower back, `cycles` times, starting at `at`.
-    func nod(_ axis:SIMD3<Double>,at:Double=1,fast:Double=450,slow:Double=260,cycles:Int=1)->[Plan] {
-        (0..<cycles).flatMap{c->[Plan] in
-            let start=at+Double(c)*0.55
-            return [(start,-axis,fast,0.2),(start+0.2,axis,slow,0.35)]
+    // A flick: fast out, slower back; with a wind-up, first a small slow swing the other way.
+    func flick(_ axis:SIMD3<Double>,at:Double,peak:Double=600,windUp:Bool=false)->[Plan] {
+        let start=windUp ? at+0.12:at
+        return (windUp ? [(at,-axis,0.3*peak,0.12)]:[])+[(start,axis,peak,0.14),(start+0.14,-axis,0.6*peak,0.22)]
+    }
+    func teach(_ gesture:CaseGesture,_ samples:[(Double,SIMD3<Double>)],others:[CaseGesture:ClosedCaseFlickTemplate]=[:])->(events:[ClosedCaseFlickTeacher.Event],template:ClosedCaseFlickTemplate?,at:Double?) {
+        var teacher=ClosedCaseFlickTeacher(gesture:gesture,others:others),events:[ClosedCaseFlickTeacher.Event]=[],template:ClosedCaseFlickTemplate?,at:Double?
+        for (stamp,w) in samples{for event in teacher.feed(stamp:stamp,w:w){events.append(event);if case .learned(let found)=event{template=found;at=stamp}}}
+        return (events,template,at)
+    }
+    func heard(_ events:[ClosedCaseFlickTeacher.Event])->[Int]{events.compactMap{if case .heard(let n)=$0{return n};return nil}}
+    func run(_ samples:[(Double,SIMD3<Double>)],_ templates:[CaseGesture:ClosedCaseFlickTemplate])->[ClosedCaseFlickRecognizer.Event] {
+        var recognizer=ClosedCaseFlickRecognizer();recognizer.templates=templates
+        return samples.flatMap{recognizer.feed(stamp:$0.0,w:$0.1)}
+    }
+    func found(_ events:[ClosedCaseFlickRecognizer.Event])->[CaseGesture]{events.compactMap{if case .flick(let g,_,_)=$0{return g};return nil}}
+    let up=SIMD3(1.0,0,0),side=SIMD3(0.0,1,0)
+    let kinds:[(CaseGesture,SIMD3<Double>,Bool)]=[(.flickUp,up,false),(.flickDown,-up,false),(.flickLeft,side,true),(.flickRight,-side,true)]
+    // Four flicks a little different each time teach it, a dot each; each flick knows the others.
+    func four(_ axis:SIMD3<Double>,_ windUp:Bool)->[Plan]{[520.0,600,680,560].enumerated().flatMap{flick(axis,at:0.5+Double($0.offset)*0.9,peak:$0.element,windUp:windUp)}}
+    var taught:[CaseGesture:ClosedCaseFlickTemplate]=[:]
+    for (gesture,axis,windUp) in kinds {
+        let lesson=teach(gesture,motion(4.5,four(axis,windUp)),others:taught)
+        guard let template=lesson.template,heard(lesson.events)==[1,2,3,4] else{
+            throw LessonError.message("Four flicks must teach \(gesture.title), a dot each: \(lesson.events).")
         }
+        guard ClosedCaseFlickTemplate(stored:template.stored)==template else{throw LessonError.message("A taught flick must round-trip.")}
+        taught[gesture]=template
     }
-    func run(_ samples:[(Double,SIMD3<Double>)],_ flicks:[FlickAxis:ClosedCaseFlick])->[ClosedCaseFlickDetector.Event] {
-        var detector=ClosedCaseFlickDetector();detector.flicks=flicks
-        return samples.flatMap{detector.feed(stamp:$0.0,w:$0.1)}
+    // Each is itself, flicked at another speed, and not any other.
+    for (gesture,axis,windUp) in kinds {
+        let events=run(motion(2,flick(axis,at:0.5,peak:640,windUp:windUp)),taught)
+        guard found(events)==[gesture] else{throw LessonError.message("A \(gesture.title.lowercased()) must be recognised as one: \(events).")}
     }
-    func named(_ events:[ClosedCaseFlickDetector.Event])->[FlickAxis]{events.map{if case .flick(let a,_,_)=$0{return a};return .vertical}}
-    let up=SIMD3(0.0,1,0),side=SIMD3(1.0,0,0)
-    let both:[FlickAxis:ClosedCaseFlick]=[.vertical:ClosedCaseFlick(axis:up,peak:340),.horizontal:ClosedCaseFlick(axis:side,peak:340)]
-    guard named(run(motion(3,nod(up)),both))==[.vertical],named(run(motion(3,nod(side,fast:700)),both))==[.horizontal] else{
-        throw LessonError.message("A fast, big flick up and back must be vertical, and one to the side horizontal.")
+    // Before it's recognised, a burst turning fast says so, from when its fast part began, so the pointer can
+    // hold from there; the flick then says when its burst began, wind-up and all.
+    let told=run(motion(2,flick(-side,at:0.5,peak:640,windUp:true)),taught)
+    guard case .fast(let fastSince)?=told.first,fastSince>1e3+0.6,fastSince<1e3+0.7,
+          case .flick(.flickRight,let since,_)?=told.last,since<1e3+0.5,since>1e3+0.45 else{
+        throw LessonError.message("A held-through flick must say it's fast, from where its fast part began, then when it began: \(told).")
     }
-    guard named(run(motion(5,nod(up,cycles:5)),both))==[.vertical] else{throw LessonError.message("Flicking several times in a row must count once.")}
-    // Direction: `nod` swings against its axis first, so a nod about +up is a flick down, about -up a flick up.
-    func direction(_ plan:[Plan])->CaseGesture? {
-        guard case .flick(let axis,let turn,_)? = run(motion(3,plan),both).first else{return nil}
-        return closedCaseFlickGesture(axis,turn:turn,up:up,right:side)
+    guard found(run(motion(2,flick(up,at:0.5,peak:150)),taught)).isEmpty else{throw LessonError.message("A slow flick must not count.")}
+    guard found(run(motion(2,[(0.5,up,500,0.25)]),taught)).isEmpty else{throw LessonError.message("One swing with no swing back must not count.")}
+    guard found(run(motion(2,flick((up+side)/2.0.squareRoot(),at:0.5)),taught)).isEmpty else{throw LessonError.message("A flick between two taught ways must count as neither.")}
+    guard found(run(motion(4,(0..<4).flatMap{flick(up,at:0.5+Double($0)*0.3)}),taught)).isEmpty else{
+        throw LessonError.message("Flicking on and on without a pause is one long burst, and must not count.")
     }
-    let down=direction(nod(up)),upward=direction(nod(-up)),left=direction(nod(side,fast:600)),right=direction(nod(-side,fast:600))
-    guard down == .flickDown,upward == .flickUp,left == .flickLeft,right == .flickRight else{
-        throw LessonError.message("A flick’s first swing must say up, down, left or right.")
+    // Teaching: a flick shaped like another taught one is turned down, a stray one fills no dot, a gentle one says so.
+    let same=teach(.flickLeft,motion(4.5,four(up,false)),others:taught.filter{$0.key == .flickUp})
+    guard same.template==nil,same.events.contains(.sameAs(.flickUp)) else{throw LessonError.message("Teaching a flick like another must say which: \(same.events).")}
+    let stray=teach(.flickUp,motion(6,flick(up,at:0.5)+flick(side,at:1.4,windUp:true)+flick(up,at:2.4,peak:560)+flick(up,at:3.3,peak:650)+flick(up,at:4.2,peak:520)))
+    guard stray.template != nil,heard(stray.events)==[1,2,3,4],stray.events.contains(.different) else{
+        throw LessonError.message("A stray flick while teaching must fill no dot, and the rest still teach it: \(stray.events).")
     }
-    guard closedCaseFlickGesture(.vertical,turn:up,up:nil,right:side)==nil else{throw LessonError.message("Without calibration a flick has no direction.")}
-    // Sensor seconds: the nod's first swing starts 1 s into a stream stamped from 1000 s.
-    guard case .flick(_,_,let since)? = run(motion(3,nod(up)),both).first,abs(since-1001)<0.02 else{
-        throw LessonError.message("A gesture must say when it began, so the pointer can go back there: \(String(describing:run(motion(3,nod(up)),both).first)).")
-    }
-    guard run(motion(3,nod(up,fast:260,slow:200)),both).isEmpty else{throw LessonError.message("A slow nod must not count.")}
-    guard run(motion(3,[(1,-up,600,0.04),(1.04,up,400,0.04)]),both).isEmpty else{throw LessonError.message("A fast twitch too small to see must not count.")}
-    guard run(motion(3,[(1,-up,500,0.25)]),both).isEmpty else{throw LessonError.message("One swing with no swing back must not count.")}
-    let diagonal=(up+side)/length(up+side)
-    guard run(motion(3,nod(diagonal)),both).isEmpty else{throw LessonError.message("A nod between the two axes must count as neither.")}
-    guard run(motion(3,nod(up),drift:SIMD3(0,0,130)),both).isEmpty else{throw LessonError.message("A nod that doesn’t start from a steady aim must not count.")}
-    var detail="flicks at 340°/s or more, up, down, left and right by their first swing, one per burst, not slow, small, one-way, diagonal or unsteady ones"
+    guard teach(.flickUp,motion(2,flick(up,at:0.5,peak:150))).events.contains(.tooSlow) else{throw LessonError.message("A flick too gentle to learn must say so.")}
+    var detail="flicks: each of four taught from four of the person's own, recognised at other speeds as itself and nothing else; not slow, one-way, in-between or endless ones; teaching refuses one like another"
     if let fixtures {
-        // The recorded natural nod and shake: their own axes, then one Yes and one No.
-        let gestures=try loadClosedCaseTapFixtures(fixtures.deletingLastPathComponent().appendingPathComponent("GestureFixtures.csv"))
+        // Real flicks (Tests/FlickFixtures.csv): taught from the first four of each, the rest are themselves.
+        let recorded=try loadClosedCaseTapFixtures(fixtures.deletingLastPathComponent().appendingPathComponent("FlickFixtures.csv"))
+        let rest=SIMD3(0.215,0.907,0.232)
         func gyro(_ name:String)throws->[(Double,SIMD3<Double>)] {
-            guard let segment=gestures.first(where:{$0.name==name}) else{throw LessonError.message("The \(name) fixture is missing.")}
-            return segment.rows.sorted{$0[2]<$1[2]}.map{($0[2],SIMD3($0[4],$0[5],$0[6])*1e-5)}
+            guard let segment=recorded.first(where:{$0.name==name}) else{throw LessonError.message("The \(name) fixture is missing.")}
+            return segment.rows.sorted{$0[2]<$1[2]}.map{($0[2],SIMD3($0[4],$0[5],$0[6])*1e-5-rest)}
         }
-        let nodRows=try gyro("nod"),shakeRows=try gyro("shake")
-        guard let yesAxis=ClosedCaseFlickLearner.principalAxis(nodRows.map(\.1).filter{length($0)>=40}),
-              let noAxis=ClosedCaseFlickLearner.principalAxis(shakeRows.map(\.1).filter{length($0)>=40}) else{throw LessonError.message("The recorded gestures have no axis.")}
-        let taught:[FlickAxis:ClosedCaseFlick]=[.vertical:ClosedCaseFlick(axis:yesAxis,peak:ClosedCaseFlickDetector.defaultPeak),.horizontal:ClosedCaseFlick(axis:noAxis,peak:ClosedCaseFlickDetector.defaultPeak)]
-        guard named(run(nodRows,taught))==[.vertical],named(run(shakeRows,taught))==[.horizontal] else{
-            throw LessonError.message("The recorded nod must be one Yes and the recorded shake one No: got \(named(run(nodRows,taught))) and \(named(run(shakeRows,taught))).")
+        let ups=try gyro("flickUp"),downs=try gyro("flickDown"),more=try gyro("flickDownAgain")
+        let upLesson=teach(.flickUp,ups),downLesson=teach(.flickDown,downs,others:upLesson.template.map{[.flickUp:$0]} ?? [:])
+        guard let upTaught=upLesson.template,let downTaught=downLesson.template,let upAt=upLesson.at,let downAt=downLesson.at else{
+            throw LessonError.message("Real flicks must teach up and down: \(upLesson.events), \(downLesson.events).")
         }
-        var learner=ClosedCaseFlickLearner(),taughtYes:ClosedCaseFlick?
-        for (stamp,w) in nodRows{for event in learner.feed(stamp:stamp,w:w){if case .learned(let found)=event{taughtYes=found}}}
-        guard let taughtYes,abs((taughtYes.axis*yesAxis).sum())>0.95 else{throw LessonError.message("The recorded nod must teach Yes on its own.")}
-        // The recorded pointing and taps, about many axis pairs: never a gesture.
-        let segments=try loadClosedCaseTapFixtures(fixtures).filter{$0.name=="pointing" || $0.name=="held"}
-        var seed:UInt64=7
-        func random()->Double{seed=seed&*6364136223846793005&+1442695040888963407;return Double(seed>>11)/Double(1<<53)*2-1}
-        for _ in 0..<24 {
-            var a=SIMD3(random(),random(),random());a/=length(a)
-            var b=SIMD3(random(),random(),random());b-=a*(a*b).sum();b/=length(b)
-            let flicks:[FlickAxis:ClosedCaseFlick]=[.vertical:ClosedCaseFlick(axis:a,peak:ClosedCaseFlickDetector.defaultPeak),.horizontal:ClosedCaseFlick(axis:b,peak:ClosedCaseFlickDetector.defaultPeak)]
-            for segment in segments {
-                let rows:[[Double]]=segment.rows.filter{$0[1]==12}.sorted{$0[2]<$1[2]}
-                let samples:[(Double,SIMD3<Double>)]=rows.map{row in (row[2],SIMD3<Double>(row[4],row[5],row[6])*1e-5)}
-                guard run(samples,flicks).isEmpty else{throw LessonError.message("Recorded \(segment.name) gave a gesture about a random axis.")}
-            }
+        let real:[CaseGesture:ClosedCaseFlickTemplate]=[.flickUp:upTaught,.flickDown:downTaught]
+        let laterUps=found(run(ups.filter{$0.0>upAt},real)),laterDowns=found(run(downs.filter{$0.0>downAt},real)+run(more,real))
+        guard !laterUps.isEmpty,laterUps.allSatisfy({$0 == .flickUp}),laterDowns.count>=7,laterDowns.allSatisfy({$0 == .flickDown}) else{
+            throw LessonError.message("Real flicks after teaching must be themselves: up \(laterUps), down \(laterDowns).")
         }
-        detail+="; the recorded nod and shake each once, and nothing in recorded pointing or taps about 24 random axis pairs"
+        // Recorded pointing, holding and closing the lid: never a flick, whichever are taught.
+        for segment in try loadClosedCaseTapFixtures(fixtures).filter({["pointing","held","lidclose"].contains($0.name)}) {
+            let samples=segment.rows.filter{$0[1]==12}.sorted{$0[2]<$1[2]}.map{($0[2],SIMD3($0[4],$0[5],$0[6])*1e-5)}
+            for templates in [real,taught] where !found(run(samples,templates)).isEmpty{throw LessonError.message("Recorded \(segment.name) gave a flick: \(run(samples,templates)).")}
+        }
+        detail+=String(format:"; real flicks taught from four, then %d more up and %d down each themselves; none in recorded pointing, holding or lid closes",laterUps.count,laterDowns.count)
     }
-    // Teaching: one natural "yes, yes, yes" teaches it; so do single nods with pauses, leaving a stray shake out;
-    // a gentle one says so.
-    let axis=SIMD3(0.6,0.8,0.0),stray=SIMD3(0.0,0.0,1.0)
-    func teach(_ plan:[Plan],seconds:Double)->(counts:[Int],learned:ClosedCaseFlick?) {
-        var learner=ClosedCaseFlickLearner(),counts:[Int]=[],learned:ClosedCaseFlick?
-        for (stamp,w) in motion(seconds,plan){for event in learner.feed(stamp:stamp,w:w){
-            if case .flick(let agreeing,_)=event{counts.append(agreeing)}
-            if case .learned(let found)=event{learned=found}
-        }}
-        return (counts,learned)
-    }
-    let once=teach(nod(axis,at:1,fast:460,cycles:3),seconds:4)
-    guard let onceLearned=once.learned,abs((onceLearned.axis*axis).sum())>0.98,abs(onceLearned.peak-max(300,0.7*460))<15,once.counts==[1,2,3] else{
-        throw LessonError.message("Nodding three times in one go must teach it, a dot at a time: \(once).")
-    }
-    let eager=teach(nod(axis,at:1,fast:700,cycles:3),seconds:4)
-    guard eager.learned?.peak==ClosedCaseFlickDetector.highestPeak,ClosedCaseFlick(stored:[0,1,0,775])?.peak==ClosedCaseFlickDetector.highestPeak,
-          ClosedCaseFlick(stored:[0,1,0,120])?.peak==ClosedCaseFlickDetector.lowestPeak else{
-        throw LessonError.message("Teaching eagerly must not set a bar that misses everyday flicks: \(String(describing:eager.learned)).")
-    }
-    let apart=teach(nod(axis,at:1,fast:420)+nod(stray,at:3,fast:500)+nod(-axis,at:5,fast:480)+nod(axis,at:7,fast:460),seconds:10)
-    guard let apartLearned=apart.learned,abs((apartLearned.axis*axis).sum())>0.98,apart.counts.last==3 else{
-        throw LessonError.message("Nods with pauses must teach it, leaving a stray shake out: \(apart).")
-    }
-    var gentle=ClosedCaseFlickLearner(),saidSlow=false
-    for (stamp,w) in motion(4,nod(axis,fast:200,slow:150)){if gentle.feed(stamp:stamp,w:w).contains(.tooSlow){saidSlow=true}}
-    guard saidSlow else{throw LessonError.message("A nod too gentle to learn must say so.")}
-    detail+="; bars kept to 300–340°/s however eagerly taught; one natural yes-yes-yes teaches it, a dot a nod, and so do nods with pauses, without a stray one"
     // Double tap: two close taps are one gesture; one tap clicks once its window has passed.
     var gate=ClosedCaseDoubleTap();let a=CGPoint(x:0.2,y:0.3),b=CGPoint(x:0.4,y:0.5)
     guard gate.tap(since:1,point:a,now:10).isEmpty,gate.tap(since:1.2,point:b,now:10.2)==[.double(a)],!gate.waiting,
@@ -631,26 +652,78 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
     var moved=CGPoint.zero
     for i in 0...100{moved=anchor.apply(CGPoint(x:0.6,y:0.5+0.002*Double(i)),at:1+Double(i)*0.005)}
     guard abs(moved.y-0.7)<1e-9,abs(moved.x-0.6)<1e-6 else{throw LessonError.message("Moving twice the offset must bring the pointer back to the aim: \(moved).")}
-    var edgeAnchor=ClosedCasePointerAnchor();edgeAnchor.anchor(CGPoint(x:0,y:0.5),at:CGPoint(x:0.1,y:0.5))
-    var atEdge=CGPoint.zero
-    for i in 0..<800{atEdge=edgeAnchor.apply(CGPoint(x:0,y:0.5),at:Double(i)*0.005)}
-    guard atEdge.x<0.003 else{throw LessonError.message("Pointing past an edge must reach it: \(atEdge).")}
-    // The glide eases toward the aim, carries on through a short gap, and settles after a long one.
-    var glide=ClosedCaseCursorGlide()
-    glide.aim(CGPoint(x:0.5,y:0.5),at:0);_=glide.step(at:0)
-    glide.aim(CGPoint(x:0.6,y:0.5),at:0.02)
-    let soon=glide.step(at:0.025)?.x ?? 0,later=glide.step(at:0.06)?.x ?? 0,settled=glide.step(at:0.4)?.x ?? 0
-    guard soon>0.5,soon<0.6,later>soon,abs(settled-0.66)<0.01 else{throw LessonError.message("The cursor must glide toward the aim and settle a little ahead of a moving aim.")}
-    glide.hold(CGPoint(x:0.1,y:0.1),at:0.5);_=glide.step(at:0.55)
-    guard let heldAt=glide.step(at:0.8),abs(heldAt.x-0.1)<1e-6,abs(heldAt.y-0.1)<1e-6 else{throw LessonError.message("A held point must stay put.")}
-    // No jumps: moving across the screen (a flick's return, recentering) glides there over 180 ms at 60 Hz, with no
-    // frame's step much bigger than its neighbours', starting and ending slowly.
-    func frames(_ glide:inout ClosedCaseCursorGlide,from start:Double,count:Int)->[CGPoint]{(1...count).compactMap{glide.step(at:start+Double($0)/60)}}
-    var across=ClosedCaseCursorGlide();across.place(CGPoint(x:0.1,y:0.5),at:0);across.move(to:CGPoint(x:0.9,y:0.5),at:0)
-    let path=[CGPoint(x:0.1,y:0.5)]+frames(&across,from:0,count:15),steps=zip(path,path.dropFirst()).map{$1.x-$0.x}
+    // After a flick the pointer carries on from where it was, for good.
+    var kept=ClosedCasePointerAnchor();kept.anchor(CGPoint(x:0.6,y:0.5),at:CGPoint(x:0.5,y:0.5),keep:true)
+    var carried=CGPoint.zero
+    for i in 0...100{carried=kept.apply(CGPoint(x:0.6,y:0.5+0.002*Double(i)),at:Double(i)*0.005)}
+    guard abs(carried.x-0.5)<1e-9,abs(carried.y-0.7)<1e-9 else{throw LessonError.message("After a flick the pointer must carry on from where it was: \(carried).")}
+    // Pushing past an edge at an aiming pace moves the aim along (here 0.15 past it, at half a screen a
+    // second), so coming back leaves the edge at once; a fast swing past it and back lands where it started.
+    for i in 0...260{carried=kept.apply(CGPoint(x:0.6+0.0025*Double(i),y:0.7),at:1+Double(i)*0.005)}
+    guard abs(carried.x-1)<1e-9,abs(kept.base.dx+0.25)<1e-6 else{throw LessonError.message("Pushing past an edge must reach it and move the aim along: \(carried), \(kept.base).")}
+    for i in 1...20{carried=kept.apply(CGPoint(x:1.25-0.005*Double(i),y:0.7),at:3+Double(i)*0.005)}
+    guard abs(carried.x-0.9)<1e-6 else{throw LessonError.message("Coming back from past an edge must leave it at once: \(carried).")}
+    var swung=ClosedCasePointerAnchor();var swing=CGPoint.zero
+    let out=(0...20).map{0.5+0.04*Double($0)}
+    for (i,x) in (out+out.reversed()).enumerated(){swing=swung.apply(CGPoint(x:x,y:0.5),at:Double(i)*0.005)}
+    guard abs(swing.x-0.5)<1e-9,swung.base == .zero else{throw LessonError.message("A fast swing past an edge and back must land where it started: \(swing).")}
+    // The timeline: samples every 5 ms of a steady sweep, delivered in bursts as Bluetooth does (a few at a time,
+    // sometimes 15 at once after a 70 ms wait), play back at 60 Hz in even steps, with no stalls.
+    func frames(_ timeline:inout ClosedCaseCursorTimeline,from start:Double,count:Int)->[CGPoint]{(1...count).compactMap{timeline.step(at:start+Double($0)/60)}}
+    var even=ClosedCaseCursorTimeline(),pending:[(t:Double,point:CGPoint,host:Double)]=[],burstSizes=[2,3,4,15,3,1,8,3,4,2,12,3],shownPath:[CGPoint]=[]
+    var index=0,size=0
+    for k in 0..<600 {
+        let t=100+Double(k)*0.005,point=CGPoint(x:0.1+0.3*Double(k)*0.005,y:0.5)
+        size+=1;let burst=burstSizes[index%burstSizes.count]
+        pending.append((t,point,0))
+        if size>=burst{let arrived=t+0.004;for i in pending.count-size..<pending.count{pending[i].host=arrived};index+=1;size=0}
+    }
+    var next=0
+    for frame in 0..<150 {
+        let now=100.2+Double(frame)/60
+        while next<pending.count,pending[next].host>0,pending[next].host<=now{even.add(pending[next].point,at:pending[next].t,arrived:pending[next].host);next+=1}
+        if let point=even.step(at:now),frame>=20{shownPath.append(point)}
+    }
+    let stepsX=zip(shownPath,shownPath.dropFirst()).map{$1.x-$0.x},ideal=0.3/60
+    guard stepsX.count>100,stepsX.allSatisfy({abs($0-ideal)<0.35*ideal}) else{
+        throw LessonError.message("Bursty samples must play back in even steps: \(stepsX.map{String(format:"%.4f",$0)}).")
+    }
+    // A hold heard 20 ms after it began (a tap) never shows the twitch it held through.
+    var tapped=ClosedCaseCursorTimeline(),most=0.0
+    for k in 0..<240 {
+        let t=200+Double(k)*0.005,twitch=k>=120 ? 0.05*min(1,Double(k-120)/8):0
+        // Until the tap is heard the twitch goes on the track; from then on the session adds where it holds.
+        tapped.add(CGPoint(x:k<=124 ? 0.5+twitch:0.5,y:0.5),at:t,arrived:t+0.002)
+        if k==124{tapped.rewrite(from:200.6,to:CGPoint(x:0.5,y:0.5),glide:false)}
+        if k%3==0{most=max(most,tapped.step(at:t+0.002)?.x ?? 0)}
+    }
+    guard most<0.5+1e-6 else{throw LessonError.message("A tap's twitch must never show: the cursor reached \(most).")}
+    // Moving across the screen (recentering, a flick's return) glides over 180 ms at 60 Hz, with no frame's step
+    // much bigger than its neighbours', starting and ending slowly.
+    var across=ClosedCaseCursorTimeline()
+    for k in 0..<10{across.add(CGPoint(x:0.1,y:0.5),at:300+Double(k)*0.005,arrived:300.05)}
+    _=across.step(at:300.1);across.reset()
+    for k in 0..<200{across.add(CGPoint(x:0.9,y:0.5),at:300.05+Double(k)*0.005,arrived:300.055+Double(k)*0.005)}
+    let path=[CGPoint(x:0.1,y:0.5)]+frames(&across,from:300.1,count:15),steps=zip(path,path.dropFirst()).map{$1.x-$0.x}
     guard steps.allSatisfy({$0 >= -1e-9}),steps.max() ?? 1<0.15,steps.first ?? 1<0.05,abs((path.last?.x ?? 0)-0.9)<1e-6,
           zip(steps,steps.dropFirst()).allSatisfy({abs($1-$0)<0.06}) else{
         throw LessonError.message("Moving across the screen must glide, not jump: \(steps.map{String(format:"%.3f",$0)}).")
+    }
+    // Letting go of a hold glides from the next sample on, however late that sample shows.
+    var letGo=ClosedCaseCursorTimeline(),biggest=0.0,previous:CGPoint?
+    for k in 0..<160 {
+        let t=400+Double(k)*0.005
+        if k==60{letGo.glide(fromNext:true)}
+        letGo.add(CGPoint(x:k<60 ? 0.3:0.7,y:0.5),at:t,arrived:t+0.002)
+        if k%3==0,let point=letGo.step(at:t+0.002){if let previous{biggest=max(biggest,abs(point.x-previous.x))};previous=point}
+    }
+    guard biggest<0.06,abs((previous?.x ?? 0)-0.7)<1e-6 else{throw LessonError.message("Letting go of a hold must glide: a step of \(biggest).")}
+    // Pointing starts from where the system cursor is and glides on from there.
+    var placed=ClosedCaseCursorTimeline()
+    for k in 0..<60{placed.add(CGPoint(x:0.5,y:0.5),at:500+Double(k)*0.005,arrived:500.005+Double(k)*0.005)}
+    placed.place(CGPoint(x:0.2,y:0.2))
+    guard let first=placed.step(at:500.15),first.x<0.25,let last=frames(&placed,from:500.15,count:14).last,abs(last.x-0.5)<1e-6 else{
+        throw LessonError.message("Pointing must start from where the cursor is and glide to the aim.")
     }
     // The display link steps the cursor once per refresh of the screen, at 60 Hz or more, without posting here.
     if let screen=NSScreen.main {
@@ -660,12 +733,6 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
         let rate=Double(output.frames)/0.5;output.stop()
         guard output.frames>0,rate>=50,rate<=260 else{throw LessonError.message("The cursor must step once per display refresh, at 60 Hz or more: \(rate) Hz.")}
         detail+=String(format:"; cursor steps at %.0f Hz with the display",rate)
-    }
-    // A new calibration's first aim glides from where the cursor was, and so does the first aim after placing it
-    // where the system cursor is.
-    var recentred=ClosedCaseCursorGlide();recentred.place(CGPoint(x:0.2,y:0.2),at:0);recentred.reset();recentred.aim(CGPoint(x:0.5,y:0.5),at:0)
-    guard let first=recentred.step(at:1.0/60),first.x<0.25,let last=frames(&recentred,from:1.0/60,count:12).last,abs(last.x-0.5)<1e-6 else{
-        throw LessonError.message("Recentering must glide to the new aim.")
     }
     // Actions: stored and loaded, and risky or taken shortcuts refused.
     for preset in GestureAction.presets{guard GestureAction(stored:preset.action.stored)==preset.action else{throw LessonError.message("\(preset.title) didn’t round-trip.")}}
@@ -680,5 +747,5 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
           GestureShortcut.refusal(custom.shortcut!,pointer:pointer,others:[]) == nil else{
         throw LessonError.message("Gesture shortcuts must refuse quitting, the pointer shortcut and a shortcut another gesture sends.")
     }
-    return "gestures: "+detail+"; double tap; the pointer stays where it clicked until moved; cursor glide, with no jumps at 60 Hz; actions stored and risky shortcuts refused"
+    return "gestures: "+detail+"; double tap; the pointer stays where it clicked until moved and where a flick left it, and pushing past an edge moves the aim along; bursty samples play back evenly at 60 Hz, a tap\u{2019}s twitch never shows, and changes of course glide; actions stored and risky shortcuts refused"
 }

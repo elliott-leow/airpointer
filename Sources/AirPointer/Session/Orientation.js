@@ -133,10 +133,12 @@ export class Grip {
    throw Error('Aim in a different direction. Return to center, then aim toward the top.');
   this[name]=axis;
  }
- point(q){
+ // Where the case points on the screen, 0…1 across and down. `free`: past the edges too (up to a screen
+ // beyond), so the pointer can tell how far past an edge someone is pushing.
+ point(q,free=false){
   if(!this.center||!this.right||!this.up)return null;
   const v=this.relative(q),r=this.right,u=this.up,rr=dot(r,r),uu=dot(u,u),ru=dot(r,u),d=rr*uu-ru*ru;
-  const x=(dot(v,r)*uu-dot(v,u)*ru)/d,y=(dot(v,u)*rr-dot(v,r)*ru)/d;
-  return [Math.max(0,Math.min(1,.5+x/2)),Math.max(0,Math.min(1,.5-y/2))];
+  const x=(dot(v,r)*uu-dot(v,u)*ru)/d,y=(dot(v,u)*rr-dot(v,r)*ru)/d,low=free?-1:0,high=free?2:1;
+  return [Math.max(low,Math.min(high,.5+x/2)),Math.max(low,Math.min(high,.5-y/2))];
  }
 }

@@ -115,29 +115,31 @@ final class GestureDots:NSView {
     }
 }
 
-// Teaching the flicks of one axis: a sheet on the main window that fills a dot for each flick, then learns the
-// line they swing along and how fast. One primary: Done once learned, Try Again after a failure; Cancel otherwise.
+// Teaching one flick: a sheet on the main window that fills a dot for each of four flicks that agree, then
+// keeps them as the person's own flick. One primary: Done once learned, Try Again after a failure; Cancel otherwise.
 final class GestureTeachSheet:NSObject {
-    let axis:FlickAxis
+    let gesture:CaseGesture
     let window:NSWindow
     var onDone:(()->Void)?,onCancel:(()->Void)?,onRetry:(()->Void)?
     private let title=rkLabel("",17,.semibold)
     private let body=rkWrap("",13,.secondaryLabelColor)
-    private let dots=GestureDots(count:ClosedCaseFlickLearner.flicks)
+    private let dots=GestureDots(count:ClosedCaseFlickTeacher.flicks)
     private let note=rkWrap("",12,.secondaryLabelColor)
     private lazy var cancel=RemoteButton("Cancel",style:.secondary,height:32,target:self,action:#selector(cancelPressed))
     private lazy var primary=RemoteButton("Listening…",style:.primary,height:32,target:self,action:#selector(primaryPressed))
-    enum State:Equatable{case listening(heard:Int,mixed:Bool,slow:Bool),learned,failed(String),unavailable(String)}
-    private(set) var state=State.listening(heard:0,mixed:false,slow:false)
+    // While listening, `note` says why the last flick didn't fill a dot.
+    enum State:Equatable{case listening(heard:Int,note:String?),learned,failed(String),unavailable(String)}
+    private(set) var state=State.listening(heard:0,note:nil)
+    var heard:Int{if case .listening(let heard,_)=state{return heard};return 0}
 
-    init(axis:FlickAxis) {
-        self.axis=axis
+    init(gesture:CaseGesture) {
+        self.gesture=gesture
         window=NSWindow(contentRect:NSRect(x:0,y:0,width:420,height:290),styleMask:[.titled],backing:.buffered,defer:false)
         super.init()
-        window.title="Teach \(axis.title)"
+        window.title="Teach \(gesture.name)"
         let root=RemoteSurface(HomePalette.canvas)
-        rkSetText(title,"Teach \(axis.title)")
-        rkSetText(body,"\(axis.movement) Each flick fills a dot, all in one go or with pauses. The pointer pauses while you teach it.")
+        rkSetText(title,"Teach \(gesture.name)")
+        rkSetText(body,"Flick the case \(gesture.way) and back, the way you’ll use it, four times with a moment’s pause after each. Each flick fills a dot. The pointer pauses while you teach it.")
         let buttons=rkHStack([rkSpacer(),cancel,primary],spacing:8)
         let stack=rkVStack([title,body,dots,note,buttons],spacing:12,align:.leading)
         stack.setCustomSpacing(20,after:body);stack.setCustomSpacing(20,after:dots);stack.setCustomSpacing(20,after:note)
@@ -158,12 +160,12 @@ final class GestureTeachSheet:NSObject {
     private func render() {
         primary.isEnabled=true;cancel.isHidden=false
         switch state {
-        case .listening(let heard,let mixed,let slow):
+        case .listening(let heard,let said):
             dots.heard=heard;primary.title="Listening…";primary.isEnabled=false
-            rkSetText(note,slow ? "Flick faster and bigger.":mixed ? "Flick along the same line each time.":"Hold the case upright, the way you point with it.")
+            rkSetText(note,said ?? "Hold the case upright, the way you point with it.")
         case .learned:
             dots.heard=dots.count;primary.title="Done";cancel.isHidden=true
-            rkSetText(note,"Learned. Choose what each flick does in Settings.")
+            rkSetText(note,"Learned. Choose what it does in Settings.")
         case .failed(let reason):
             dots.heard=0;primary.title="Try Again";rkSetText(note,reason)
         case .unavailable(let reason):
@@ -173,7 +175,7 @@ final class GestureTeachSheet:NSObject {
     }
     @objc private func primaryPressed() {
         switch state {
-        case .failed:update(.listening(heard:0,mixed:false,slow:false));onRetry?()
+        case .failed:update(.listening(heard:0,note:nil));onRetry?()
         default:onDone?()
         }
     }

@@ -365,10 +365,10 @@ func runHomeChecks()throws {
         setup.update(SetupState(link:.holdStill,holdProgress:0.62));try windowSnapshot("setup-hold-still",setup.window,.aqua)
         setup.update(SetupState(link:.connected));try windowSnapshot("setup-connected",setup.window,.aqua)
         // Teaching a gesture: listening with one flick heard, learned, and turned down.
-        let teach=GestureTeachSheet(axis:.vertical)
-        teach.update(.listening(heard:1,mixed:false,slow:false));try windowSnapshot("gesture-teach-listening",teach.window,.aqua)
+        let teach=GestureTeachSheet(gesture:.flickRight)
+        teach.update(.listening(heard:2,note:"That one went another way. Flick the same way each time."));try windowSnapshot("gesture-teach-listening",teach.window,.aqua)
         teach.update(.learned);try windowSnapshot("gesture-teach-learned",teach.window,.darkAqua)
-        teach.update(.failed("That’s the same line as Left and Right. "+FlickAxis.vertical.movement));try windowSnapshot("gesture-teach-failed",teach.window,.aqua)
+        teach.update(.failed("Those went different ways. Try again, flicking right the same way each time."));try windowSnapshot("gesture-teach-failed",teach.window,.aqua)
         // The two moving steps as contact sheets, to check timing and direction.
         for (name,step,times) in [("case-steps-opening",CaseStep.opening,[0.0,0.8,1.0,1.2,1.4,1.6,3.2]),("case-steps-open",.open,[0.0,0.4,0.6,0.8,1.0,1.2,2.0]),("case-steps-close",.close,[0.0,0.8,1.0,1.2,1.4,1.6,3.2]),("case-steps-turn",.turn,[0.0,0.9,1.1,1.3,1.5,1.7,3.4])] {
             let row=NSView(frame:NSRect(x:0,y:0,width:CGFloat(times.count)*200,height:200))
