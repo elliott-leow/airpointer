@@ -400,5 +400,6 @@ func runClosedCaseTapChecks(fixtures:URL?) throws {
         guard (14...15).contains(held) else{throw LessonError.message("\(held) of 15 recorded hand-held taps clicked; at least 14 must.")}
         detail+="; \(held) of 15 hand-held recorded taps clicked, \(segments.filter{!$0.name.hasPrefix("tap") && $0.name != "held"}.count) recorded handling and pointing segments never clicked"
     }
+    detail+="; "+(try runClosedCaseGestureChecks(fixtures:fixtures))
     print("PASS: closed-case tap detection, \(detail)")
 }

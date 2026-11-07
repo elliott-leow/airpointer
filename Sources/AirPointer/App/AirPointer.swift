@@ -20,6 +20,7 @@ final class App: NSObject, NSApplicationDelegate {
     var closedCaseSession:ClosedCaseSession?
     var tapTestWindow:TapTestWindow?
     var setupTaps=SetupTaps()
+    var gestureSheet:GestureTeachSheet?
     // Set when the person backs out of closed-case calibration, so the dots don't reopen on the next tick.
     var closedCalibrationDeclined=false
     // Paired AirPods Pro and AirPods 5, refreshed when Settings opens.

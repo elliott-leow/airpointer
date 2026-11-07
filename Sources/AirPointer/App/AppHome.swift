@@ -15,6 +15,11 @@ extension App {
         applyPointerSettings(pointerSettings,to:session)
         session.onPoint={ [weak self] point in self?.homePreview.point=point;self?.statusBar?.updatePointer(point) }
         session.onFrame={ [weak self] frame in if self?.calibrator.closedCase != nil{self?.calibrator.feed(frame)} }
+        session.onGesture={ [weak self] gesture,action in
+            guard let self else{return}
+            let symbol=gesture == .yes ? "checkmark":gesture == .no ? "xmark":"hand.tap"
+            self.hud.show("\(gesture.title) · \(action.title)",symbol:symbol,on:self.controlledScreen)
+        }
         closedCalibrationDeclined=false
         session.onUpdate={ [weak self] session in
             guard let self,self.closedCaseSession === session else{return}
@@ -76,6 +81,7 @@ extension App {
             view.onDisconnect={ [weak self] in self?.disconnectClosedCase() }
             view.onSetup={ [weak self] in self?.runSetupAgain() }
             view.onTeachTap={ [weak self] in self?.teachTap() }
+            view.onTeachGesture={ [weak self] gesture in self?.teachGesture(gesture) }
             view.onSettings={ [weak self] in self?.showHomeSettings() }
             view.onPointerSettingsChange={ [weak self] value in self?.applyHomePointerSettings(value) }
             view.onClose={ [weak self] in self?.pause() }
@@ -151,6 +157,7 @@ extension App {
     }
     private func applyPointerSettings(_ value:PointerSettingsState,to session:ClosedCaseSession){
         session.speed=value.speed;session.clickSound=value.clickSound;session.tapDirection=value.tapDirection
+        session.gestureActions=value.gestureActions;session.taughtFlicks=value.taughtFlicks
         session.screenIndex=value.screen
     }
     func applyHomePointerSettings(_ value:PointerSettingsState){
@@ -163,11 +170,51 @@ extension App {
         let screenChanged=pointerSettings.screen != next.screen
         pointerSettings.speed=next.speed
         pointerSettings.clickSound=next.clickSound
+        pointerSettings.gestureActions=next.gestureActions
         if screenChanged,NSScreen.screens.indices.contains(next.screen){pointerSettings.screen=next.screen;pointerSettings.screenID=NSScreen.screens[next.screen].displayID}
         pointerSettings.persist()
         if screenChanged{pause()}
         if let session=closedCaseSession{applyPointerSettings(pointerSettings,to:session)}
         home?.updatePointerSettings(homePointerSettings())
+    }
+    // Teaching Yes or No: a sheet on the main window, with the pointer paused until it closes.
+    func teachGesture(_ gesture:CaseGesture){
+        guard let home,gestureSheet==nil else{return}
+        let sheet=GestureTeachSheet(gesture:gesture);gestureSheet=sheet
+        let close={[weak self,weak sheet] in
+            guard let self,let sheet else{return}
+            self.closedCaseSession?.stopLearningFlick()
+            home.window.endSheet(sheet.window);self.gestureSheet=nil
+        }
+        sheet.onDone=close;sheet.onCancel=close
+        sheet.onRetry={[weak self,weak sheet] in if let sheet{self?.listenForFlick(gesture,sheet:sheet)}}
+        listenForFlick(gesture,sheet:sheet)
+        home.window.beginSheet(sheet.window)
+    }
+    private func listenForFlick(_ gesture:CaseGesture,sheet:GestureTeachSheet){
+        guard let session=closedCaseSession,session.canTeachFlicks else{
+            sheet.update(.unavailable("Connect your AirPods and turn the case upright, then teach it."));return
+        }
+        pause()
+        sheet.update(.listening(heard:0,mixed:false,slow:false))
+        session.learnFlick{[weak self,weak sheet] event in
+            guard let self,let sheet else{return}
+            switch event {
+            case .flick(let agreeing,let total):sheet.update(.listening(heard:agreeing,mixed:total>agreeing,slow:false))
+            case .tooSlow:
+                if case .listening(let heard,let mixed,_)=sheet.state{sheet.update(.listening(heard:heard,mixed:mixed,slow:true))}
+            case .learned(let flick):
+                // Yes and No have to be different movements, or one would set off the other.
+                let other=gesture == .yes ? CaseGesture.no:.yes
+                if let taken=self.pointerSettings.taughtFlicks[other],abs((taken.axis*flick.axis).sum())>0.75{
+                    sheet.update(.failed("That’s the same movement as \(other.title). \(gesture.movement)"));return
+                }
+                self.pointerSettings.taughtFlicks[gesture]=flick;self.pointerSettings.persist()
+                if let session=self.closedCaseSession{self.applyPointerSettings(self.pointerSettings,to:session)}
+                sheet.update(.learned(self.pointerSettings.gestureActions[gesture] ?? .nothing))
+            case .failed:sheet.update(.failed("Those flicks went different ways. \(gesture.movement)"))
+            }
+        }
     }
     @objc func openHomeSettings(){showHome();showHomeSettings()}
     @objc func homeMenuControl(){showHome();homeControlAction()}

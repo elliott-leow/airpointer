@@ -12,7 +12,8 @@ func runHomeChecks()throws {
     func content()->[NSView]{home.window.contentView!.layoutSubtreeIfNeeded();return visible(home.window.contentView!)}
     func words()->String{content().compactMap{$0 as? NSTextField}.map(\.stringValue).joined(separator:" ")}
     func primary()->RemoteButton{content().compactMap{$0 as? RemoteButton}.first{$0.style == .primary}!}
-    // The closed case is the only pointer: no mode choice, no microphone and no Gestures or Practice to find.
+    // The closed case is the only pointer: no mode choice, no microphone and no Practice to find. Gestures are
+    // the case's own movements (Settings ▸ Gestures), so they may be named.
     func retired(_ views:[NSView],_ surface:String)throws{
         let text=views.flatMap{view->[String] in
             var parts=[view.accessibilityLabel() ?? "",view.toolTip ?? "",(view as? NSTextField)?.stringValue ?? "",(view as? NSButton)?.title ?? ""]
@@ -20,7 +21,7 @@ func runHomeChecks()throws {
             return parts
         }.joined(separator:" · ")
         // The tap's click sound is the one sound the pointer makes.
-        for word in ["pointer only","\\bmic(rophone)?\\b","\\bgestures?\\b","\\bpractice\\b","(?<!click )\\bsound\\b"] {
+        for word in ["pointer only","\\bmic(rophone)?\\b","\\bpractice\\b","(?<!click )\\bsound\\b"] {
             try require(text.range(of:word,options:[.regularExpression,.caseInsensitive])==nil,"\(surface) still says “\(word)”")
         }
         try require(!views.contains{$0 is NSSegmentedControl || $0.accessibilityRole() == .radioGroup},"\(surface) still offers a choice of modes or sections")
@@ -326,6 +327,13 @@ func runHomeChecks()throws {
         sample.selectSettings();try render("settings",from:sample)
         sample.window.appearance=NSAppearance(named:.darkAqua);try render("settings-dark",from:sample)
         sample.window.appearance=NSAppearance(named:.aqua)
+        // The whole Settings page at once, with gestures given actions, one of them a custom shortcut.
+        var gestures=PointerSettingsState(screens:["Built-in Retina Display","Projector"],screen:1,speed:1.4)
+        gestures.gestureActions=[.yes:GestureAction.presets[1].action,.doubleTap:.keys(GestureShortcut(key:40,modifiers:[.command,.shift],name:"K"))]
+        sample.updatePointerSettings(gestures)
+        sample.window.setFrame(NSRect(origin:sample.window.frame.origin,size:NSSize(width:size.width,height:1500)),display:false)
+        try render("settings-full",from:sample)
+        sample.window.setFrame(NSRect(origin:sample.window.frame.origin,size:size),display:false)
         sample.window.orderOut(nil)
         // The other redesigned surfaces, rendered from the real bundle.
         func snapshot(_ name:String,_ view:NSView,_ appearance:NSAppearance.Name? = .aqua)throws{
@@ -356,6 +364,11 @@ func runHomeChecks()throws {
         setup.update(SetupState(link:.turnUpright));try windowSnapshot("setup-turn",setup.window,.aqua)
         setup.update(SetupState(link:.holdStill,holdProgress:0.62));try windowSnapshot("setup-hold-still",setup.window,.aqua)
         setup.update(SetupState(link:.connected));try windowSnapshot("setup-connected",setup.window,.aqua)
+        // Teaching a gesture: listening with one flick heard, learned, and turned down.
+        let teach=GestureTeachSheet(gesture:.yes)
+        teach.update(.listening(heard:1,mixed:false,slow:false));try windowSnapshot("gesture-teach-listening",teach.window,.aqua)
+        teach.update(.learned(GestureAction.presets[1].action));try windowSnapshot("gesture-teach-learned",teach.window,.darkAqua)
+        teach.update(.failed("That’s the same movement as No. "+CaseGesture.yes.movement));try windowSnapshot("gesture-teach-failed",teach.window,.aqua)
         // The two moving steps as contact sheets, to check timing and direction.
         for (name,step,times) in [("case-steps-opening",CaseStep.opening,[0.0,0.8,1.0,1.2,1.4,1.6,3.2]),("case-steps-open",.open,[0.0,0.4,0.6,0.8,1.0,1.2,2.0]),("case-steps-close",.close,[0.0,0.8,1.0,1.2,1.4,1.6,3.2]),("case-steps-turn",.turn,[0.0,0.9,1.1,1.3,1.5,1.7,3.4])] {
             let row=NSView(frame:NSRect(x:0,y:0,width:CGFloat(times.count)*200,height:200))
@@ -418,5 +431,5 @@ func runHomeChecks()throws {
         NSGraphicsContext.restoreGraphicsState()
         try sheet.representation(using:.png,properties:[:])?.write(to:folder.appendingPathComponent("menu-bar-icon.png"))
     }
-    print("PASS: one primary action per phase, pointer-only surfaces (no mode, microphone, Gestures or Practice on home, settings, setup or menu bar), four-step setup, the notch's connect steps and plain settings")
+    print("PASS: one primary action per phase, pointer-only surfaces (no mode, microphone or Practice on home, settings, setup or menu bar), four-step setup, the notch's connect steps and plain settings")
 }

@@ -29,7 +29,17 @@ Every image, animation and instruction must match this. Nothing else.
 
 Never show or describe tapping the back of the case, holding the open case upright, or "keep the lid open", except in the Connect step.
 
-**There are no modes.** The closed case is the only pointer, from its motion and taps alone. A single tap on its front left-clicks whenever the pointer is pointing; there is no double click and no setting for tapping itself, and Pause or fn ⌃ stops tapping along with the cursor. There are no swipes. Never mention the microphone in the product. The only sounds are the tap’s click and the notch’s shimmer (below).
+**There are no modes.** The closed case is the only pointer, from its motion and taps alone. A single tap on its front left-clicks whenever the pointer is pointing, and Pause or fn ⌃ stops tapping along with the cursor. Never mention the microphone in the product. The only sounds are the tap’s click and the notch’s shimmer (below).
+
+**Gestures** (Settings ▸ Gestures) do nothing until someone gives them an action, so nobody sets one off by surprise. There are three, chosen so none can pass for another or for pointing:
+
+| Gesture | Movement | Why it can't be mistaken |
+|---|---|---|
+| Yes | A fast flick up and straight back | One swing of 150°/s or more, 50–300 ms out and as long back, ending where it began, about the case's up axis |
+| No | A fast flick to one side and straight back | The same, about the side axis. Teaching refuses a No that matches Yes |
+| Double tap | Two taps on the front within 0.35 s | While it has an action, a single tap clicks 0.35 s later; without one, taps click at once |
+
+Aiming is one sweep, or a sweep with a small correction, and a tap is a 20 ms twitch, so neither is a flick. Yes and No each have a **Teach…** sheet: three flicks that agree teach the axis and the speed (60% of a typical flick, never under 150°/s); untaught, they use the calibrated up and right axes at 200°/s. A gesture that lands is confirmed in the HUD (“Yes · Return”), and a flick puts the pointer back where it was before it began. Actions are a preset key or click, or a custom shortcut; a custom shortcut can't be the pointer shortcut, one another gesture sends, or one that quits, closes or locks things.
 
 ## 3. Surfaces
 
@@ -40,7 +50,7 @@ Never show or describe tapping the back of the case, holding the open case uprig
 | Main window ("Remote") | Two pages, **Pointer** and **Settings**, and no section tabs: the toolbar is only the gear. Settings opens with a "‹ Pointer" back button; esc and ⌘1 also go back. Pages scroll; a notice bar sits above them. | 440 × 700, min 400 × 620, max width 560 |
 | Menu-bar popover | Live aim pad, Recenter, Pause, speed, then menu rows: Open AirPointer, Calibrate…, Disconnect (only while the closed case is connected), Settings…, Quit. | 320 wide |
 | Control HUD | A small non-activating capsule: "Pointing", "Paused — reason", "Disconnected — connect again, then open the lid", "Pointer stopped — allow AirPointer in Accessibility". | 40 tall, ≤ 480 wide |
-| Sheets | Attached to the main window, for a task that starts there. None are in use. | ≈ 420 wide |
+| Sheets | Attached to the main window, for a task that starts there. **Teach Yes / Teach No** (Settings ▸ Gestures ▸ Teach…): the movement in one line, three dots that fill as the person flicks, a note (flick faster, flick the same way each time), and one primary: Listening… (disabled), then Done, or Try Again after a mixed or doubled-up movement. The pointer pauses while it's open. | 420 × 290 |
 | Developer tools | Keep audio on Mac and the tap test window. Under **File ▸ Developer** only; never linked from the main flows. The test window uses the same parts as the product: a DEVELOPER eyebrow and status chip, a 22 pt title, one primary bottom-right. | 480 × 440 |
 
 A flow should never open a second regular window to finish a task that started in the main window. Use the overlay, a sheet, or the page itself.
@@ -86,6 +96,10 @@ While the pointer is in use, from Connect until the session ends, Mac sound and 
 ### The pointer shortcut
 
 One shortcut does it all from any app: connect, cancel, pause and resume (`PointerShortcut.swift`). It's fn ⌃ until changed in Settings, and every surface shows the current one, never a fixed string. It's either modifiers alone, which must include fn, or a key with ⌃ or ⌥; anything looser would go off during typing or other apps' shortcuts.
+
+### Pointer feel
+
+The cursor moves on its own 200 Hz clock, not when motion arrives: Bluetooth delivers motion in bursts 20–60 ms apart, and moving only then reads as jumping. Each step eases toward the latest aim (20 ms) and carries it forward at its recent speed for up to 30 ms, so a short gap keeps moving and a long one settles. Under that, the aim is filtered by speed: steady while held still (1.2 Hz, below hand tremor), and quicker as it moves (15 Hz sweeping a screen a second). A click or a gesture holds the cursor where it was before the movement began.
 
 ### Cursor size
 
@@ -163,6 +177,8 @@ Wrapping text uses `rkWrap` (a `RemoteWrappingLabel`, which tracks its own width
 | `AccessibilityGuide` | Replaces macOS's Accessibility prompt: opens the list in System Settings, with AirPointer as a card to drag into it. | Hangs above the + and − buttons in that window and follows it. Shows only while System Settings is in front, never takes focus, and goes away once allowed. |
 | `CalibrationOverlayView` | Full-screen dwell calibration. | Step, progress ring, hint, success state. |
 | `MenuRow` | Popover menu rows. | n/a |
+| `GestureActionControl` | What a gesture does: presets, then Custom Shortcut…, which records the next key pressed. | Turns down a shortcut with the reason in the row's caption, and keeps the old choice. |
+| `GestureTeachSheet`, `GestureDots` | Teaching Yes or No. | Ink dots on the canvas; one primary. |
 
 When a system control can't meet the rules in §4 (blue, translucent), draw a small custom control here, with accessibility, keyboard and focus-ring support, instead of restyling it locally.
 
