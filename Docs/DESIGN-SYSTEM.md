@@ -39,7 +39,7 @@ Never show or describe tapping the back of the case, holding the open case uprig
 | No | A fast, big shake, once or several times | The same about the shake's axis. A swing counts for whichever axis it fits clearly better, and teaching refuses a No that matches Yes |
 | Double tap | Two taps on the front within 0.35 s | While it has an action, a single tap clicks 0.35 s later; without one, taps click at once |
 
-Aiming never swings that fast and that far back and forth, and a tap is a 20 ms twitch. Nodding several times is one Yes: nothing more counts until the case settles. Yes and No each have a **Teach…** sheet: three bursts that agree teach the axis and the speed; untaught, they use the calibrated up and right axes. A gesture that lands is confirmed in the HUD (“Yes · Return”), and the pointer goes back to where it was when the gesture began. Actions are a preset key or click, or a custom shortcut; a custom shortcut can't be the pointer shortcut, one another gesture sends, or one that quits, closes or locks things.
+Aiming never swings that fast and that far back and forth, and a tap is a 20 ms twitch. Nodding several times is one Yes: nothing more counts until the case settles. Yes and No each have a **Teach…** sheet: each nod or shake fills a dot, so a natural “yes, yes, yes” teaches it in one go, and three that agree set the axis and the speed; untaught, they use the calibrated up and right axes. A gesture that lands is confirmed in the HUD (“Yes · Return”), and the pointer goes back to where it was when the gesture began. Actions are a preset key or click, or a custom shortcut; a custom shortcut can't be the pointer shortcut, one another gesture sends, or one that quits, closes or locks things.
 
 ## 3. Surfaces
 

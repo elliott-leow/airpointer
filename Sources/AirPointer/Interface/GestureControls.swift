@@ -138,7 +138,7 @@ final class GestureTeachSheet:NSObject {
         window.title="Teach \(gesture.title)"
         let root=RemoteSurface(HomePalette.canvas)
         rkSetText(title,"Teach \(gesture.title)")
-        rkSetText(body,"\(gesture.movement) Do it three times, with a pause between. The pointer pauses while you teach it.")
+        rkSetText(body,"\(gesture.movement) Each \(gesture == .no ? "shake":"nod") fills a dot, all in one go or with pauses. The pointer pauses while you teach it.")
         let buttons=rkHStack([rkSpacer(),cancel,primary],spacing:8)
         let stack=rkVStack([title,body,dots,note,buttons],spacing:12,align:.leading)
         stack.setCustomSpacing(20,after:body);stack.setCustomSpacing(20,after:dots);stack.setCustomSpacing(20,after:note)

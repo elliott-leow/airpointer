@@ -105,18 +105,19 @@ struct ClosedCaseFlickDetector {
     }
 }
 
-// Learns a gesture from three bursts that agree, without knowing its axis first: each burst runs from a
-// steady moment until the case settles; its axis is the one it turned about most; its swings along that axis
-// have to make a fast, big pair, judged with a bar of 250°/s. Nods up-first or down-first are one axis. The
-// speed then needed is 70% of the typical faster swing, never under 300°/s. A burst that swings clearly but
-// too gently says so.
+// Learns a gesture from three of its swing pairs that agree, without knowing its axis first. A burst runs
+// from a steady moment until the case settles; its axis is the one it turned about most; every pair of swings
+// along that axis that is fast and big (judged with a bar of 250°/s) is one example, so a natural "yes, yes,
+// yes" teaches it at once, and nods with pauses between do too. The dots fill while the person nods. Nods
+// up-first or down-first are one axis. The speed then needed is 70% of the typical faster swing, never under
+// 300°/s. A burst that swings clearly but too gently says so.
 struct ClosedCaseFlickLearner {
     enum Event:Equatable{case flick(agreeing:Int,total:Int),tooSlow,learned(ClosedCaseFlick),failed}
-    static let flicks=3,mostFlicks=8,agree=0.85,learningBar=250.0,peakShare=0.7,longestBurst=4.0
+    static let flicks=3,mostFlicks=10,agree=0.85,learningBar=250.0,peakShare=0.7,longestBurst=4.0,checkEvery=0.15
     private typealias Detector=ClosedCaseFlickDetector
-    private struct Example{var axis:SIMD3<Double>,peak:Double}
+    struct Example{var axis:SIMD3<Double>,peak:Double}
     private var burst:[(t:Double,w:SIMD3<Double>)]=[],recent:[(t:Double,w:SIMD3<Double>)]=[],last:Double?,quietSince:Double?,steady=false
-    private var examples:[Example]=[],done=false
+    private var examples:[Example]=[],live:[Example]=[],heard=0,checkedAt=0.0,done=false
 
     private static func length(_ v:SIMD3<Double>)->Double{(v*v).sum().squareRoot()}
     mutating func feed(stamp:Double,w:SIMD3<Double>)->[Event] {
@@ -127,9 +128,11 @@ struct ClosedCaseFlickLearner {
         defer{recent.append((t,w));while let first=recent.first,t-first.t>0.3{recent.removeFirst()}}
         if speed>=Detector.onset {
             quietSince=nil
-            if burst.isEmpty{steady=(recent.filter{$0.t>=t-0.25 && $0.t<=t-0.05}.map{Self.length($0.w)}.max() ?? .infinity)<=Detector.calm}
+            if burst.isEmpty{steady=(recent.filter{$0.t>=t-0.25 && $0.t<=t-0.05}.map{Self.length($0.w)}.max() ?? .infinity)<=Detector.calm;checkedAt=t}
             burst.append((t,w))
             if let first=burst.first,t-first.t>Self.longestBurst{return finishBurst()}
+            // While the burst goes on, every so often: the pairs so far, so the dots fill as the person nods.
+            if t-checkedAt>=Self.checkEvery{checkedAt=t;return update()}
             return []
         }
         guard !burst.isEmpty else{return []}
@@ -148,8 +151,8 @@ struct ClosedCaseFlickLearner {
         }
         return v
     }
-    // The fastest qualifying pair of swings along `axis` in a burst, as (peak of its faster swing, its axis).
-    static func bestPair(_ samples:[(t:Double,w:SIMD3<Double>)],axis:SIMD3<Double>,bar:Double)->(peak:Double,axis:SIMD3<Double>)? {
+    // Every fast, big pair of swings along `axis`, one after another without sharing a swing.
+    static func pairs(_ samples:[(t:Double,w:SIMD3<Double>)],axis:SIMD3<Double>,bar:Double)->[Example] {
         typealias Swing=ClosedCaseFlickDetector.Swing
         var swings:[Swing]=[],current:Swing?,last:Double?
         for (t,w) in samples {
@@ -162,30 +165,40 @@ struct ClosedCaseFlickLearner {
             } else if abs(s)>=Detector.onset{current=Swing(sign:s>0 ? 1:-1,start:t,peak:abs(s),off:off)}
         }
         if var swing=current{swing.end=last ?? swing.start;swings.append(swing)}
-        var best:(peak:Double,axis:SIMD3<Double>)?
-        for (first,second) in zip(swings,swings.dropFirst()) where Detector.qualifies(first,second,secondLasted:second.end-second.start,bar:bar) {
-            let peak=max(first.peak,second.peak),turn=first.turn-second.turn,n=length(turn)
-            if n>0,peak>(best?.peak ?? 0){best=(peak,turn/n)}
+        var found:[Example]=[],index=0
+        while index+1<swings.count {
+            let first=swings[index],second=swings[index+1]
+            if Detector.qualifies(first,second,secondLasted:second.end-second.start,bar:bar) {
+                let turn=first.turn-second.turn,n=length(turn)
+                if n>0{found.append(Example(axis:turn/n,peak:max(first.peak,second.peak)))}
+                index+=2
+            } else{index+=1}
         }
-        return best
+        return found
+    }
+    // The examples that share an axis (either way round) with the best-supported one.
+    static func agreeing(_ examples:[Example])->[Example] {
+        let axes=examples.map(\.axis)
+        guard let seed=axes.max(by:{a,b in axes.filter{abs(($0*a).sum())>=agree}.count<axes.filter{abs(($0*b).sum())>=agree}.count}) else{return []}
+        return examples.filter{abs(($0.axis*seed).sum())>=agree}.map{(($0.axis*seed).sum()<0) ? Example(axis:-$0.axis,peak:$0.peak):$0}
+    }
+    private mutating func update()->[Event] {
+        live=steady ? Self.principalAxis(burst.map(\.w)).map{Self.pairs(burst,axis:$0,bar:Self.learningBar)} ?? []:[]
+        let all=examples+live,members=Self.agreeing(all)
+        var events:[Event]=[]
+        if members.count>heard{heard=members.count;events.append(.flick(agreeing:members.count,total:all.count))}
+        if members.count>=Self.flicks {
+            let peaks=members.map(\.peak).sorted(),typical=peaks[peaks.count/2],sum=members.reduce(SIMD3<Double>.zero){$0+$1.axis}
+            done=true;events.append(.learned(ClosedCaseFlick(axis:sum,peak:max(Detector.lowestPeak,typical*Self.peakShare))))
+        } else if all.count>=Self.mostFlicks{done=true;events.append(.failed)}
+        return events
     }
     private mutating func finishBurst()->[Event] {
-        defer{burst=[];quietSince=nil}
-        guard steady,let axis=Self.principalAxis(burst.map(\.w)) else{return []}
-        guard let pair=Self.bestPair(burst,axis:axis,bar:Self.learningBar) else{
-            let fastest=burst.map{abs(($0.w*axis).sum())}.max() ?? 0
-            return fastest>=120 ? [.tooSlow]:[]
-        }
-        examples.append(Example(axis:pair.axis,peak:pair.peak))
-        let axes=examples.map(\.axis)
-        guard let seed=axes.max(by:{a,b in axes.filter{abs(($0*a).sum())>=Self.agree}.count<axes.filter{abs(($0*b).sum())>=Self.agree}.count}) else{return []}
-        let members=examples.filter{abs(($0.axis*seed).sum())>=Self.agree}
-        var events:[Event]=[.flick(agreeing:members.count,total:examples.count)]
-        if members.count>=Self.flicks {
-            let sum=members.reduce(SIMD3<Double>.zero){$0+(($1.axis*seed).sum()<0 ? -$1.axis:$1.axis)}
-            let peaks=members.map(\.peak).sorted(),typical=peaks[peaks.count/2]
-            done=true;events.append(.learned(ClosedCaseFlick(axis:sum,peak:max(Detector.lowestPeak,typical*Self.peakShare))))
-        } else if examples.count>=Self.mostFlicks{done=true;events.append(.failed)}
+        defer{burst=[];live=[];quietSince=nil}
+        var events=update()
+        guard !done else{return events}
+        if live.isEmpty,let axis=Self.principalAxis(burst.map(\.w)),(burst.map{abs(($0.w*axis).sum())}.max() ?? 0)>=120{events.append(.tooSlow)}
+        examples+=live
         return events
     }
 }
@@ -402,9 +415,9 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
         guard named(run(nodRows,taught))==[.yes],named(run(shakeRows,taught))==[.no] else{
             throw LessonError.message("The recorded nod must be one Yes and the recorded shake one No: got \(named(run(nodRows,taught))) and \(named(run(shakeRows,taught))).")
         }
-        var learner=ClosedCaseFlickLearner(),heard:[ClosedCaseFlickLearner.Event]=[]
-        for (stamp,w) in nodRows+[(nodRows.last!.0+400000,SIMD3<Double>.zero),(nodRows.last!.0+800000,.zero)]{heard+=learner.feed(stamp:stamp,w:w)}
-        guard heard==[.flick(agreeing:1,total:1)] else{throw LessonError.message("The recorded nod must teach as one nod: \(heard).")}
+        var learner=ClosedCaseFlickLearner(),taughtYes:ClosedCaseFlick?
+        for (stamp,w) in nodRows{for event in learner.feed(stamp:stamp,w:w){if case .learned(let found)=event{taughtYes=found}}}
+        guard let taughtYes,abs((taughtYes.axis*yesAxis).sum())>0.95 else{throw LessonError.message("The recorded nod must teach Yes on its own.")}
         // The recorded pointing and taps, about many axis pairs: never a gesture.
         let segments=try loadClosedCaseTapFixtures(fixtures).filter{$0.name=="pointing" || $0.name=="held"}
         var seed:UInt64=7
@@ -421,21 +434,29 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
         }
         detail+="; the recorded nod and shake each once, and nothing in recorded pointing or taps about 24 random axis pairs"
     }
-    // Teaching: three nod bursts along one axis teach it, leaving a stray shake out; a gentle one says so.
+    // Teaching: one natural "yes, yes, yes" teaches it; so do single nods with pauses, leaving a stray shake out;
+    // a gentle one says so.
     let axis=SIMD3(0.6,0.8,0.0),stray=SIMD3(0.0,0.0,1.0)
-    var learner=ClosedCaseFlickLearner(),learned:ClosedCaseFlick?,counts:[Int]=[]
-    let teach=motion(12,nod(axis,at:1,fast:420,cycles:2)+nod(stray,at:3.5,fast:500)+nod(-axis,at:5.5,fast:480)+nod(axis,at:8,fast:460,cycles:3))
-    for (stamp,w) in teach{for event in learner.feed(stamp:stamp,w:w){
-        if case .flick(let agreeing,_)=event{counts.append(agreeing)}
-        if case .learned(let found)=event{learned=found}
-    }}
-    guard let learned,abs((learned.axis*axis).sum())>0.98,abs(learned.peak-max(300,0.7*460))<15,counts.last==3 else{
-        throw LessonError.message("Three nods along one axis must teach it, leaving a stray one out: \(counts), \(String(describing:learned)).")
+    func teach(_ plan:[Plan],seconds:Double)->(counts:[Int],learned:ClosedCaseFlick?) {
+        var learner=ClosedCaseFlickLearner(),counts:[Int]=[],learned:ClosedCaseFlick?
+        for (stamp,w) in motion(seconds,plan){for event in learner.feed(stamp:stamp,w:w){
+            if case .flick(let agreeing,_)=event{counts.append(agreeing)}
+            if case .learned(let found)=event{learned=found}
+        }}
+        return (counts,learned)
+    }
+    let once=teach(nod(axis,at:1,fast:460,cycles:3),seconds:4)
+    guard let onceLearned=once.learned,abs((onceLearned.axis*axis).sum())>0.98,abs(onceLearned.peak-max(300,0.7*460))<15,once.counts==[1,2,3] else{
+        throw LessonError.message("Nodding three times in one go must teach it, a dot at a time: \(once).")
+    }
+    let apart=teach(nod(axis,at:1,fast:420)+nod(stray,at:3,fast:500)+nod(-axis,at:5,fast:480)+nod(axis,at:7,fast:460),seconds:10)
+    guard let apartLearned=apart.learned,abs((apartLearned.axis*axis).sum())>0.98,apart.counts.last==3 else{
+        throw LessonError.message("Nods with pauses must teach it, leaving a stray shake out: \(apart).")
     }
     var gentle=ClosedCaseFlickLearner(),saidSlow=false
     for (stamp,w) in motion(4,nod(axis,fast:200,slow:150)){if gentle.feed(stamp:stamp,w:w).contains(.tooSlow){saidSlow=true}}
     guard saidSlow else{throw LessonError.message("A nod too gentle to learn must say so.")}
-    detail+="; three nods teach an axis without a stray one"
+    detail+="; one natural yes-yes-yes teaches it, a dot a nod, and so do nods with pauses, without a stray one"
     // Double tap: two close taps are one gesture; one tap clicks once its window has passed.
     var gate=ClosedCaseDoubleTap();let a=CGPoint(x:0.2,y:0.3),b=CGPoint(x:0.4,y:0.5)
     guard gate.tap(since:1,point:a,now:10).isEmpty,gate.tap(since:1.2,point:b,now:10.2)==[.double(a)],!gate.waiting,
