@@ -34,7 +34,7 @@
 |---|---|
 | AirPods Pro 3, macOS 26, Apple Silicon | Tested on one Mac with one pair |
 | AirPods Pro 2 | Recognized, not tested |
-| AirPods 5 (product ID `0x2036`) | Points with the lid closed, from the gyroscope alone. Tap to click is off. Tested on one pair. See [AirPods 5](#airpods-5) |
+| AirPods 5 (product ID `0x2036`) | Points with the lid closed and taps to click. Tested on one pair. See [AirPods 5](#airpods-5) |
 | AirPods paired with your Mac | Required |
 | Xcode | Required to build |
 
@@ -133,37 +133,39 @@ confirmed it yet.
 
 ## AirPods 5
 
-AirPods 5 point with the lid closed, from their gyroscope alone. Tap to click is off for
-them for now. Tested on one pair (firmware 9A350) on one Mac.
+AirPods 5 point with the lid closed and tap to click, like AirPods Pro. Tested on one pair
+(firmware 9A350) on one Mac.
 
 ### What is different
 
+AirPods 5 number their sensors differently, and they start the accelerometer only for a
+request in macOS's own format. Both were found in a PacketLogger capture of macOS talking to
+the earbuds: when they connect, they list their HID sensor services, and macOS starts one with
+a message type field (field 2 = 2) that AirPointer's older requests leave out.
+
 | | AirPods Pro | AirPods 5 |
 |---|---|---|
-| Motion over AirPointer's channel | Accelerometer (service 11) and gyroscope (service 12) | Gyroscope only, on service 11. Requests for the accelerometer are acknowledged, but nothing arrives |
-| Pointing | Gyroscope, pulled toward gravity | Gyroscope alone. The offset is measured while the case is still, so a slow drift is left for **Recenter** |
-| "Turn it upright" | A quarter turn from the closed pose, by gravity | A turn of 35° or more from where the pose started |
-| Tap to click | On | Off. It is found in the accelerometer |
+| Accelerometer | Service 11 | HID service 10 ("accel"), started as `0x4a` in macOS's format |
+| Gyroscope | Service 12 | Service 11 ("gyro") |
+| Service 12 | Gyroscope | "activity". It acknowledges a request but sends nothing |
 | Case model name | "AirPods Charging Case" | "Charging Case" |
 | Case keep-alive | Requests renewed each second, then a held asset | Requests renewed each second. The case never offered an asset, so its stored diagnostic data was not used |
 | Lid broadcast | Connect waits for the lid to open | Connect reaches the AirPods directly, so open the lid first |
 
-macOS's own headphone motion (`CMHeadphoneMotionManager`) does stream the AirPods 5
-accelerometer, at about 50 Hz. It stops once AirPointer's helper holds the AirPods'
-channel, which the closed case needs, so the app does not use it. To see it with no session
-running, connect the AirPods and run:
+The helper starts the accelerometer right after the gyroscope. The app maps AirPods 5
+services 10 and 11 to the Pro's 11 and 12, so pointing, calibration and taps are the
+Pro's own code. Teach Tap once: the earbuds sit in their case at a different angle. If the
+accelerometer does not stream, the session points from the gyroscope alone, without gravity
+correction and without taps.
 
-```sh
-open -W -n AirPointer.app --args --headphone-motion-probe 30
-cat ~/Library/Application\ Support/AirPointer/headphone-motion.log
-```
+The full service list, as the earbuds sent it: 1 drvcomm, 2 ttr, 3 analytics, 4 kadabra,
+5 mando, 6 ied, 7 neo, 8 neorelay, 9 comm, 10 accel, 11 gyro, 12 activity, 13 pdr, 14 cma,
+15 devmotion6, 16 SPL0, 17 HostLibHID. Asking for the list (an empty field 4) makes them
+restart their sensors for about 3 seconds, so AirPointer does not ask.
 
 ### Still unknown
 
-- How macOS turns the accelerometer on. A PacketLogger capture of macOS's own traffic
-  while it streams headphone motion would show it. With the accelerometer, AirPods 5 would
-  get gravity correction and tap to click.
-- Whether the 30-minute limit applies. Sessions on the tested pair have run more than 9
+- Whether the 30-minute limit applies. Sessions on the tested pair have run more than 12
   minutes with the lid closed.
 
 ### For developers
@@ -174,15 +176,20 @@ In a session's `native.log`:
 |---|---|
 | `ROOT MODEL name="airpods" pro=0` | The earbuds' firmware model name |
 | `CASE MODEL name="charging case"` | The case's firmware model name |
+| `ACCEL REQUEST … accel start 0x4a` | The accelerometer request in macOS's format |
+| `SENSOR ACK service=N status=S` | The earbuds acknowledged a sensor request. Status 3 answers macOS's format |
+| `STEP accelerometer streaming` | The app switched from the gyroscope alone to both sensors |
+| `SAMPLE service=10 … report=…` | A raw accelerometer report, now and then |
 | `CASE KEEPALIVE OFF … reason=…` | The case refused the keep-alive. The session goes on, and ends if motion stops |
-| `SENSOR ACK service=N status=S` | The earbuds acknowledged a sensor request |
-| `SAMPLE service=11 … report=…` | A raw sensor report, now and then |
 | `UNUSED FRAME shape=…` | The first frame of each kind the helper does not use |
-| `HID SERVICE` / `HID READY` | The earbuds listed their sensor services. Not seen yet: macOS asks first |
 
 To try other sensor requests, create `~/Library/Application Support/AirPointer/closed-case-sensor-probe`.
 Each session then asks for the services in `probeServices` (in `CaseSustainedRenewal.m`), logs what
 answers, and stops each one at the end. Delete the file to turn it off.
+
+`--headphone-motion-probe SECONDS` logs what macOS's own headphone motion
+(`CMHeadphoneMotionManager`) streams, to `headphone-motion.log`. It only streams while macOS
+owns the AirPods' channel, so not during a session.
 
 ## Troubleshooting
 

@@ -575,7 +575,11 @@ final class ClosedCaseSession: NSObject {
     // AirPods 5 stream only their gyro, and on the service the Pro uses for its accelerometer. macOS's own
     // headphone motion has their accelerometer, but it stops once the helper holds the AirPods' channel,
     // which the closed case needs. So they point from the gyro alone (see Orientation's gyroOnly).
-    var gyroOnly:Bool{productID==0x2036}
+    // Their accelerometer is HID service 10, started in macOS's own framing. Once it streams, before
+    // calibration, the session switches to the accelerometer and gyro like AirPods Pro.
+    var airPods5:Bool{productID==0x2036}
+    var gyroOnly:Bool{airPods5 && !airPods5Accel}
+    private var airPods5Accel=false,airPods5AccelRows=0
     private var closedPose:[Double]?
     var speed=1.0,clickSound=true
     var pointsWhenReady=false,usesNotch=false
@@ -722,6 +726,7 @@ final class ClosedCaseSession: NSObject {
             finished("AirPods connection setup is missing from this build.");return
         }
         do{
+            airPods5Accel=false;airPods5AccelRows=0
             try resetFusion();confirmed=false;connected=false;ready=false;stopping=false;closedAt=0;stoppedAt=0;userEnded=false;hasPointed=false;pause()
             startedAt=ProcessInfo.processInfo.systemUptime
             if let activity{ProcessInfo.processInfo.endActivity(activity)}
@@ -824,7 +829,7 @@ final class ClosedCaseSession: NSObject {
               let cs=state["case_snapshot"] as? [String:Any],let sensors=state["sensors"] as? [[String:Any]] else{return}
         let age=Date().timeIntervalSince1970-(state["updated_unix"] as? Double ?? 0)
         let sensorAges=sensors.map{$0["age_seconds"] as? Double ?? 100},motionAge=ProcessInfo.processInfo.systemUptime-lastHost
-        if gyroOnly{
+        if airPods5{
             let helperAge=sensorAges.first ?? 100
             connected=age>=0 && age<2 && helperAge>=0 && helperAge+age<1 && lastHost>0 && motionAge<1
         }else{connected=closedCaseConnectionFresh(reportAge:age,sensorAges:sensorAges,motionAge:motionAge)}
@@ -860,8 +865,19 @@ final class ClosedCaseSession: NSObject {
                 rows.append(values)
             }
             guard !rows.isEmpty else{return}
-            // AirPods 5 send their gyro on service 11; from here on it's a gyroscope row like any other.
-            handleMotion(gyroOnly ? rows.compactMap{$0[1]==11 ? [$0[0],12,$0[2],$0[3],$0[4],$0[5],$0[6]]:nil}:rows,readAt:readAt)
+            guard airPods5 else{handleMotion(rows,readAt:readAt);return}
+            // AirPods 5 send their gyro on service 11 and their accelerometer on 10; from here on they're the
+            // Pro's 12 and 11. Until the accelerometer has streamed for a moment, they point from the gyro alone.
+            if !airPods5Accel,!calibrated{
+                airPods5AccelRows+=rows.filter{$0[1]==10}.count
+                if airPods5AccelRows>=25{
+                    airPods5Accel=true;step("accelerometer streaming; pointing with accelerometer and gyro")
+                    try resetFusion()
+                }
+            }
+            handleMotion(rows.compactMap{row in
+                row[1]==11 ? [row[0],12,row[2],row[3],row[4],row[5],row[6]]:row[1]==10 && airPods5Accel ? [row[0],11,row[2],row[3],row[4],row[5],row[6]]:nil
+            },readAt:readAt)
         }catch{fail(error.localizedDescription)}
     }
     private func handleMotion(_ rows:[[Double]],readAt:Double){

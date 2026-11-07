@@ -238,6 +238,8 @@ static NSString *sensorFrameShape(uint32_t descriptor,NSData *payload) {
 @property NSString *phase;
 @property NSMutableDictionary *lastSamples;
 @property NSUInteger accelReports,gyroReports,accelFresh,gyroFresh;
+// AirPods 5's accelerometer, HID service 10 (written 0x4a when addressed with its LocationID).
+@property NSUInteger accel10Reports,accel10Fresh;
 // Frames the parser doesn't use, by shape, for the session log (AirPods 5 bring-up).
 @property NSMutableDictionary<NSString *,NSNumber *> *unusedFrames;
 @end
@@ -358,20 +360,22 @@ static NSString *sensorFrameShape(uint32_t descriptor,NSData *payload) {
                             if([field[@"number"] unsignedIntValue]==1) service=field[@"value"];
                             if([field[@"number"] unsignedIntValue]==3) report=field[@"bytes"];
                         }
-                        if(([service unsignedIntValue]==11 || [service unsignedIntValue]==12) && report.length==28) {
+                        if(service.unsignedIntValue==0x4a) service=@10;
+                        if(([service unsignedIntValue]==10 || [service unsignedIntValue]==11 || [service unsignedIntValue]==12) && report.length==28) {
                             const uint8_t *r=report.bytes;uint64_t stamp=le32(r+20) | (uint64_t)le32(r+24)<<32;
                             if(r[0]==1 && stamp>0) {
                                 used=YES;
-                                NSUInteger seen=(service.unsignedIntValue==11?self.accelReports:self.gyroReports);
+                                NSUInteger seen=(service.unsignedIntValue==10?self.accel10Reports:service.unsignedIntValue==11?self.accelReports:self.gyroReports);
                                 if(seen<4 || seen%400==0) printf("SAMPLE uptime=%.6f service=%u n=%lu report=%s\n",NSProcessInfo.processInfo.systemUptime,service.unsignedIntValue,(unsigned long)seen,hexPrefix(r,28,28).UTF8String);
                                 NSDictionary *previous=self.lastSamples[service.stringValue];
                                 BOOL fresh=!previous || stamp>[previous[@"sensor_us"] unsignedLongLongValue];
                                 NSDictionary *row=@{@"sensor_us":@(stamp),@"received_uptime":@(NSProcessInfo.processInfo.systemUptime),
                                     @"x":@((int32_t)le32(r+1)),@"y":@((int32_t)le32(r+5)),@"z":@((int32_t)le32(r+9))};
                                 if(fresh) self.lastSamples[service.stringValue]=row;
-                                if(service.unsignedIntValue==11){self.accelReports++;if(fresh)self.accelFresh++;}
+                                if(service.unsignedIntValue==10){self.accel10Reports++;if(fresh)self.accel10Fresh++;}
+                                else if(service.unsignedIntValue==11){self.accelReports++;if(fresh)self.accelFresh++;}
                                 else{self.gyroReports++;if(fresh)self.gyroFresh++;}
-                                NSUInteger sequence=self.accelReports+self.gyroReports;
+                                NSUInteger sequence=self.accelReports+self.gyroReports+self.accel10Reports;
                                 if(fresh && self.motionStream && fprintf(self.motionStream,"%lu,%u,%llu,%.9f,%d,%d,%d\n",(unsigned long)sequence,service.unsignedIntValue,(unsigned long long)stamp,[row[@"received_uptime"] doubleValue],[row[@"x"] intValue],[row[@"y"] intValue],[row[@"z"] intValue])<0) self.motionStreamFailed=YES;
                             }
                         }
@@ -835,7 +839,7 @@ static NSData *varintData(uint32_t value) {
 static NSString *sensorSequencePath=nil;
 // Set only when the file couldn't be written, so one session never repeats a number.
 static unsigned unsavedSensorSequence=0;
-static NSData *sensorSetting(uint8_t service,uint32_t interval) {
+static unsigned nextSensorSequence(void) {
     NSString *path=sensorSequencePath;
     NSString *saved=[NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
     unsigned sequence=unsavedSensorSequence?:[saved intValue];
@@ -843,11 +847,34 @@ static NSData *sensorSetting(uint8_t service,uint32_t interval) {
     BOOL written=[[NSString stringWithFormat:@"%u",sequence] writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     unsavedSensorSequence=written?0:sequence;
     if(!written) printf("sensor sequence not saved\n");
+    return sequence;
+}
+static NSData *sensorFrame(NSData *message) {
+    uint16_t n=message.length;uint8_t header[]={4,0,4,0,0x17,0,0,0,0x10,0,(uint8_t)n,(uint8_t)(n>>8)};
+    NSMutableData *data=[NSMutableData dataWithBytes:header length:sizeof(header)];[data appendData:message];return data;
+}
+static NSData *sensorSetting(uint8_t service,uint32_t interval) {
+    unsigned sequence=nextSensorSequence();
     uint8_t setting[]={8,service,16,2,26,5,1,(uint8_t)interval,(uint8_t)(interval>>8),(uint8_t)(interval>>16),(uint8_t)(interval>>24)};
     uint8_t tag=8;NSMutableData *message=[NSMutableData dataWithBytes:&tag length:1];[message appendData:varintData(sequence)];
     uint8_t field[]={66,sizeof(setting)};[message appendBytes:field length:sizeof(field)];[message appendBytes:setting length:sizeof(setting)];
-    uint16_t n=message.length;uint8_t header[]={4,0,4,0,0x17,0,0,0,0x10,0,(uint8_t)n,(uint8_t)(n>>8)};
-    NSMutableData *data=[NSMutableData dataWithBytes:header length:sizeof(header)];[data appendData:message];return data;
+    return sensorFrame(message);
+}
+// macOS's own framing, from a capture of macOS starting AirPods 5 sensors: message type 2 (field 2) ahead of
+// the request. The earbuds answer it with type 3; the older framing above gets type 1, and on AirPods 5
+// it reaches only their gyro. hidFeature sets one feature report of one HID service; hidDescribe asks the
+// earbuds to list their HID services (an empty field 4), which they answer with field 5 descriptors.
+static NSData *hidFeature(uint8_t service,uint8_t reportID,uint32_t value) {
+    unsigned sequence=nextSensorSequence();
+    uint8_t setting[]={8,service,16,2,26,5,reportID,(uint8_t)value,(uint8_t)(value>>8),(uint8_t)(value>>16),(uint8_t)(value>>24)};
+    uint8_t tag=8;NSMutableData *message=[NSMutableData dataWithBytes:&tag length:1];[message appendData:varintData(sequence)];
+    uint8_t type[]={16,2,66,sizeof(setting)};[message appendBytes:type length:sizeof(type)];[message appendBytes:setting length:sizeof(setting)];
+    return sensorFrame(message);
+}
+static NSData *hidDescribe(void) {
+    uint8_t tag=8;NSMutableData *message=[NSMutableData dataWithBytes:&tag length:1];[message appendData:varintData(nextSensorSequence())];
+    uint8_t rest[]={16,2,34,0};[message appendBytes:rest length:sizeof(rest)];
+    return sensorFrame(message);
 }
 // SENSOR PROBE (bring-up only). AirPods 5 confirm the accelerometer (service 11) but not the gyro
 // (service 12). When closed-case-sensor-probe exists beside the target file, the session also asks
@@ -945,8 +972,8 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
     // once the channel has settled makes the earbuds list their HID sensor services, which says how to
     // start the rest (found by GreenPods on AirPods Pro 3). AirPods Pro sessions are unchanged.
     const char *productText=getenv("AIRPOINTER_PRODUCT_ID");unsigned long productID=productText?strtoul(productText,NULL,0):0;
-    BOOL askServices=sensorsStarted && !exitCode && productID==0x2036,servicesAsked=NO;double servicesAskAt=NSProcessInfo.processInfo.systemUptime+.5;
-    if(askServices) printf("Product 0x%04lx: will ask the earbuds to list their sensor services\n",productID);
+    BOOL askServices=sensorsStarted && !exitCode && productID==0x2036;NSUInteger accelStep=0;double accelStepAt=NSProcessInfo.processInfo.systemUptime+.2;
+    if(askServices) printf("Product 0x%04lx: will list the sensor services and start the accelerometer (HID service 10)\n",productID);
     // AirPods 5 stream one sensor here (their gyro, on the Pro's accelerometer service). The app takes its
     // motion from macOS's headphone motion for them, so this session only has to keep that one stream alive.
     BOOL oneStream=productID==0x2036;
@@ -994,7 +1021,8 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
             BOOL fresh=YES;
             for(NSString *service in liveServices) {
                 NSDictionary *last=reader.lastSamples[service];
-                if(!last || now-[last[@"received_uptime"] doubleValue]>3) fresh=NO;
+                // AirPods 5 can pause their sensors for about 3 s when a request reconfigures them.
+                if(!last || now-[last[@"received_uptime"] doubleValue]>(oneStream?6:3)) fresh=NO;
             }
             if(!fresh) {[transfer fail:HelperExitMotionStale reason:@"Motion stopped arriving"];reason=transfer.error;break;}
         }
@@ -1003,10 +1031,15 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
             if(!discoverySent) [transfer fail:HelperExitWriteFailed reason:@"root discovery write failed"];
         }
         [transfer tick:now];
-        if(askServices && !servicesAsked && now>=servicesAskAt) {
-            servicesAsked=YES;puts("SERVICE LIST REQUEST: notifications asked again on the settled channel");
-            if(!sendPacket(output,packet(notifications,sizeof(notifications)),"known notifications again")) {[transfer fail:HelperExitWriteFailed reason:@"notifications request write failed"];reason=transfer.error;break;}
-            nextProbeAt=MAX(nextProbeAt,now+1.5);
+        // The accelerometer at 5 ms, addressed 0x4a as macOS addresses devmotion6 (0x4f). The service list
+        // (hidDescribe) is not asked for: asking made the earbuds restart their sensors for about 3 s.
+        if(askServices && accelStep<1 && now>=accelStepAt) {
+            NSData *request=hidFeature(0x4a,1,5000);const char *label="accel start 0x4a";
+            accelStep=2;nextProbeAt=MAX(nextProbeAt,now+1.5);
+            if(request) {
+                printf("ACCEL REQUEST uptime=%.6f %s\n",now,label);
+                if(!sendPacket(output,request,label)) {[transfer fail:HelperExitWriteFailed reason:@"accelerometer request write failed"];reason=transfer.error;break;}
+            }
         }
         if(probing && probeIndex<sizeof(probeServices)/sizeof(probeServices[0]) && now>=nextProbeAt) {
             SensorProbe probe=probeServices[probeIndex++];nextProbeAt=now+.5;if(![probed containsObject:@(probe.service)]) [probed addObject:@(probe.service)];
@@ -1036,7 +1069,7 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
                 @"sensors":sensors,@"earbud_state_events":[reader.earbudStateEvents copy],@"case_snapshot":[transfer status]};
             if(![[NSJSONSerialization dataWithJSONObject:status options:NSJSONWritingPrettyPrinted error:nil] writeToURL:[directory URLByAppendingPathComponent:@"status.json"] atomically:YES]) {[transfer fail:HelperExitCaptureWrite reason:@"status write failed"];reason=transfer.error;break;}
             NSDictionary *latest=reader.lastSamples[@"11"];
-            printf("HOLD phase=%s seconds=%.1f versions=%lu/%lu accel=%lu gyro=%lu arrival_minus_sensor=%.3f\n",reader.phase.UTF8String,now-began,responses,queries,(unsigned long)reader.accelReports,(unsigned long)reader.gyroReports,latest?[latest[@"received_uptime"] doubleValue]-[latest[@"sensor_us"] doubleValue]*1e-6:0);nextStatus=now+1;
+            printf("HOLD phase=%s seconds=%.1f versions=%lu/%lu accel=%lu gyro=%lu accel10=%lu arrival_minus_sensor=%.3f\n",reader.phase.UTF8String,now-began,responses,queries,(unsigned long)reader.accelReports,(unsigned long)reader.gyroReports,(unsigned long)reader.accel10Reports,latest?[latest[@"received_uptime"] doubleValue]-[latest[@"sensor_us"] doubleValue]*1e-6:0);nextStatus=now+1;
         }
         if(input.streamStatus==NSStreamStatusError || input.streamStatus==NSStreamStatusAtEnd) {reason=@"input ended";exitCode=HelperExitInputEnded;break;}
         if(now-began>15 && !motionInputVerified) {[transfer fail:HelperExitBaselineUnavailable reason:@"open baseline unavailable"];reason=transfer.error;break;}
@@ -1057,6 +1090,7 @@ static int runPointerSession(CBL2CAPChannel *channel, NSURL *directory) {
     // asset. Abandon can consume the case's staged analytics; see beginCleanup.
     BOOL accelStopped=NO,gyroStopped=NO;
     for(NSNumber *service in probed) sendPacket(output,sensorSetting(service.unsignedCharValue,0),"probe sensor STOP");
+    if(accelStep>=2) sendPacket(output,hidFeature(0x4a,1,0),"accel STOP 0x4a");
     stopSensorsThenRelease(output,transfer,accelAttempted,gyroAttempted,&accelStopped,&gyroStopped);
     // On a channel the link already ended a STOP cannot be delivered; the
     // dropped link stays the reported cause (the log line below still shows it).
@@ -1139,6 +1173,20 @@ static void sessionChecks(void) {
     void (*oldSignal)(int)=signal(SIGPIPE,SIG_IGN);reader.motionStream=fdopen(fds[1],"w");setvbuf(reader.motionStream,NULL,_IONBF,0);
     testSensorWire(reader,80006ULL*20000);check(reader.motionStreamFailed,@"closed parent motion pipe fails cleanly without SIGPIPE termination");fclose(reader.motionStream);reader.motionStream=NULL;signal(SIGPIPE,oldSignal);
     check(nextIdentifier(UINT16_MAX)==1 && nextIdentifier(1)==2,@"request IDs wrap without emitting zero");
+    {
+        NSString *sequenceFile=[NSTemporaryDirectory() stringByAppendingPathComponent:NSUUID.UUID.UUIDString];sensorSequencePath=sequenceFile;
+        [@"8118" writeToFile:sequenceFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSData *started=hidFeature(0x4f,4,10);const uint8_t *w=started.bytes;
+        // Captured from macOS: 04000400 1700 00001000 1100 08 77 10 02 42 0b 08 4f 10 02 1a 05 04 0a000000 (its sequence was 0x77).
+        const uint8_t tail[]={0x10,0x02,0x42,0x0b,0x08,0x4f,0x10,0x02,0x1a,0x05,0x04,0x0a,0,0,0};
+        check(started.length==12+3+sizeof(tail) && !memcmp(w,"\x04\x00\x04\x00\x17\x00\x00\x00\x10\x00",10) && w[10]==3+sizeof(tail) && w[12]==8 && !memcmp(w+12+3,tail,sizeof(tail)),@"a feature request has macOS's framing");
+        NSData *describe=hidDescribe();const uint8_t d[]={0x10,0x02,0x22,0x00};
+        check(describe.length==12+3+4 && !memcmp((const uint8_t *)describe.bytes+15,d,4),@"a service list request has macOS's framing");
+        [NSFileManager.defaultManager removeItemAtPath:sequenceFile error:nil];sensorSequencePath=nil;unsavedSensorSequence=0;
+        ConsoleReader *accel=ConsoleReader.new;uint8_t wire[46]={4,0,4,0,0x17,0,0,0,0x10,0,34,0,0x3a,32,8,0x4a,0x1a,28,1};
+        wire[18+20]=50;NSInputStream *in=[NSInputStream inputStreamWithData:packet(wire,sizeof(wire))];[in open];[accel stream:in handleEvent:NSStreamEventHasBytesAvailable];[in close];
+        check(accel.accel10Reports==1 && accel.lastSamples[@"10"]!=nil && accel.accelReports==0,@"an AirPods 5 accelerometer report (0x4a) counts as service 10");
+    }
     CaseSnapshot *s=testSession();[s.announced addObject:@1];s.caseActive=YES;s.caseModelVerified=YES;s.caseRouteDrained=YES;
     const uint8_t receipt[]={0,0,0,0,'M','T','I','C'},mtic[]={'M','T','I','C'},cleanup[]={0,7,0,3};
     double now=NSProcessInfo.processInfo.systemUptime;
