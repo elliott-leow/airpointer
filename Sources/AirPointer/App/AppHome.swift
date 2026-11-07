@@ -17,8 +17,7 @@ extension App {
         session.onFrame={ [weak self] frame in if self?.calibrator.closedCase != nil{self?.calibrator.feed(frame)} }
         session.onGesture={ [weak self] gesture,action in
             guard let self else{return}
-            let symbol=gesture == .yes ? "checkmark":gesture == .no ? "xmark":"hand.tap"
-            self.hud.show("\(gesture.title) · \(action.title)",symbol:symbol,on:self.controlledScreen)
+            self.hud.show("\(gesture.title) · \(action.title)",symbol:gesture.symbol,on:self.controlledScreen)
         }
         closedCalibrationDeclined=false
         session.onUpdate={ [weak self] session in
@@ -177,10 +176,10 @@ extension App {
         if let session=closedCaseSession{applyPointerSettings(pointerSettings,to:session)}
         home?.updatePointerSettings(homePointerSettings())
     }
-    // Teaching Yes or No: a sheet on the main window, with the pointer paused until it closes.
-    func teachGesture(_ gesture:CaseGesture){
+    // Teaching one axis of flicks: a sheet on the main window, with the pointer paused until it closes.
+    func teachGesture(_ gesture:FlickAxis){
         guard let home,gestureSheet==nil else{return}
-        let sheet=GestureTeachSheet(gesture:gesture);gestureSheet=sheet
+        let sheet=GestureTeachSheet(axis:gesture);gestureSheet=sheet
         let close={[weak self,weak sheet] in
             guard let self,let sheet else{return}
             self.closedCaseSession?.stopLearningFlick()
@@ -191,7 +190,7 @@ extension App {
         listenForFlick(gesture,sheet:sheet)
         home.window.beginSheet(sheet.window)
     }
-    private func listenForFlick(_ gesture:CaseGesture,sheet:GestureTeachSheet){
+    private func listenForFlick(_ gesture:FlickAxis,sheet:GestureTeachSheet){
         guard let session=closedCaseSession,session.canTeachFlicks else{
             sheet.update(.unavailable("Connect your AirPods and turn the case upright, then teach it."));return
         }
@@ -204,14 +203,14 @@ extension App {
             case .tooSlow:
                 if case .listening(let heard,let mixed,_)=sheet.state{sheet.update(.listening(heard:heard,mixed:mixed,slow:true))}
             case .learned(let flick):
-                // Yes and No have to be different movements, or one would set off the other.
-                let other=gesture == .yes ? CaseGesture.no:.yes
+                // The two axes have to be different lines, or one would set off the other.
+                let other=gesture.other
                 if let taken=self.pointerSettings.taughtFlicks[other],abs((taken.axis*flick.axis).sum())>0.75{
-                    sheet.update(.failed("That’s the same movement as \(other.title). \(gesture.movement)"));return
+                    sheet.update(.failed("That’s the same line as \(other.title). \(gesture.movement)"));return
                 }
                 self.pointerSettings.taughtFlicks[gesture]=flick;self.pointerSettings.persist()
                 if let session=self.closedCaseSession{self.applyPointerSettings(self.pointerSettings,to:session)}
-                sheet.update(.learned(self.pointerSettings.gestureActions[gesture] ?? .nothing))
+                sheet.update(.learned)
             case .failed:sheet.update(.failed("Those went different ways. \(gesture.movement)"))
             }
         }

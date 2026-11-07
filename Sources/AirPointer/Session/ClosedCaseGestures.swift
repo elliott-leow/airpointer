@@ -1,18 +1,39 @@
 import AppKit
 import Carbon
 
-// Gestures with the closed case, each of which does nothing until Settings gives it an action:
-// Yes, a fast, big nod; No, a fast, big shake; and a double tap.
+// What the closed case can do besides point, each mapped in Settings ▸ Gestures: a tap (a click unless mapped
+// to something else), a double tap, and fast, big flicks up, down, left and right. All but the tap do nothing
+// until given an action.
 enum CaseGesture:String,CaseIterable {
-    case yes,no,doubleTap
-    var title:String{switch self{case .yes:return "Yes";case .no:return "No";case .doubleTap:return "Double tap"}}
-    var movement:String {
+    case tap,doubleTap,flickUp,flickDown,flickLeft,flickRight
+    var title:String {
         switch self {
-        case .yes:return "Nod the case, fast and big, the way you’d nod yes."
-        case .no:return "Shake the case side to side, fast and big, the way you’d shake no."
-        case .doubleTap:return "Tap the front twice, quickly."
+        case .tap:return "Tap";case .doubleTap:return "Double tap"
+        case .flickUp:return "Flick up";case .flickDown:return "Flick down";case .flickLeft:return "Flick left";case .flickRight:return "Flick right"
         }
     }
+    var symbol:String {
+        switch self {
+        case .tap,.doubleTap:return "hand.tap"
+        case .flickUp:return "arrow.up";case .flickDown:return "arrow.down";case .flickLeft:return "arrow.left";case .flickRight:return "arrow.right"
+        }
+    }
+    // What it does with nothing chosen: a tap clicks, the rest do nothing.
+    var standard:GestureAction{self == .tap ? .click:.nothing}
+    static let flicks:[CaseGesture]=[.flickUp,.flickDown,.flickLeft,.flickRight]
+    var axis:FlickAxis?{switch self{case .flickUp,.flickDown:return .vertical;case .flickLeft,.flickRight:return .horizontal;default:return nil}}
+}
+
+// The two axes flicks swing about, each taught on its own. The raw values are what Settings saved when these
+// were the Yes nod and No shake, so what was taught then still counts.
+enum FlickAxis:String,CaseIterable {
+    case vertical="yes",horizontal="no"
+    var title:String{self == .vertical ? "Up and Down":"Left and Right"}
+    var movement:String {
+        self == .vertical ? "Flick the case up and back, or down and back, fast and big."
+            :"Flick the case left and back, or right and back, fast and big."
+    }
+    var other:FlickAxis{self == .vertical ? .horizontal:.vertical}
 }
 
 // One taught gesture: the axis the case swings about, in the case's own frame, and how fast its faster
@@ -28,8 +49,9 @@ struct ClosedCaseFlick:Equatable {
     }
 }
 
-// Yes and No are fast, big swings back and forth: a nod, or a shake, once or several times. Each swing is
-// measured along the gesture's axis. A pair of swings, one way then back, counts when the faster is fast
+// A flick is a fast, big swing and its return about the vertical or horizontal axis, once or several times (a
+// nod or a shake). Its direction is the first swing's: the session reads it against the calibrated up and
+// right. Each swing is measured along the axis. A pair of swings, one way then back, counts when the faster is fast
 // (340°/s untaught, or 70% of the person's own), the slower is at least 35% of it, both turn 15° or more and
 // one 30° or more, each lasts 50-600 ms, neither wanders off its axis, and the case was steady before the
 // first. The pair's own axis then has to match this gesture's clearly better than the other's, and only one
@@ -37,15 +59,16 @@ struct ClosedCaseFlick:Equatable {
 // over 56 s of recorded pointing and the recorded taps, nothing counts about any of 200 random axis pairs,
 // while the recorded natural nod and shake (Tests/GestureFixtures.csv) each count once.
 struct ClosedCaseFlickDetector {
-    enum Event:Equatable{case flick(CaseGesture,since:Double)}
+    // `turn` is the first swing's rotation, to tell up from down and left from right.
+    enum Event:Equatable{case flick(FlickAxis,turn:SIMD3<Double>,since:Double)}
     // Rotation rates in degrees per second, angles in degrees, times in seconds.
     static let defaultPeak=340.0,lowestPeak=300.0,onset=40.0,calm=60.0,slowerShare=0.35
     static let shortestSwing=0.05,longestSwing=0.6,smallestSwing=15.0,largeSwing=30.0,offAxisShare=0.65
     static let alignment=0.7,margin=0.08,settle=0.25,fade=0.15,maximumGap=0.1
-    var flicks:[CaseGesture:ClosedCaseFlick]=[:]
+    var flicks:[FlickAxis:ClosedCaseFlick]=[:]
     struct Swing{var sign:Double,start:Double,end=0.0,peak:Double,angle=0.0,turn=SIMD3<Double>.zero,off:Double,quietSince:Double?=nil}
     private struct Track{var swing:Swing?,previous:Swing?,steady=false}
-    private var tracks:[CaseGesture:Track]=[:],recent:[(t:Double,w:SIMD3<Double>)]=[],last:Double?
+    private var tracks:[FlickAxis:Track]=[:],recent:[(t:Double,w:SIMD3<Double>)]=[],last:Double?
     private var settling=false,quietSince:Double?
 
     mutating func reset(){tracks=[:];recent=[];last=nil;settling=false;quietSince=nil}
@@ -71,7 +94,7 @@ struct ClosedCaseFlickDetector {
             guard let quietSince,t-quietSince>=Self.settle else{return []}
             settling=false;tracks=[:]
         }
-        for gesture in CaseGesture.allCases {
+        for gesture in FlickAxis.allCases {
             guard let flick=flicks[gesture] else{continue}
             var k=tracks[gesture] ?? Track()
             let s=(w*flick.axis).sum(),off=Self.length(w-flick.axis*s)
@@ -99,10 +122,19 @@ struct ClosedCaseFlickDetector {
             let scores=flicks.map{(gesture:$0.key,fit:abs(($0.value.axis*pair).sum())/n)}.sorted{$0.fit>$1.fit}
             guard scores[0].gesture==gesture,scores[0].fit>=Self.alignment,scores[0].fit-(scores.count>1 ? scores[1].fit:0)>=Self.margin else{continue}
             settling=true;quietSince=nil;tracks=[:]
-            return [.flick(gesture,since:previous.start)]
+            return [.flick(gesture,turn:previous.turn,since:previous.start)]
         }
         return []
     }
+}
+
+// Which flick a detected one is: up or down along the calibrated up, left or right along the calibrated right.
+func closedCaseFlickGesture(_ axis:FlickAxis,turn:SIMD3<Double>,up:SIMD3<Double>?,right:SIMD3<Double>?)->CaseGesture? {
+    let reference=axis == .vertical ? up:right
+    guard let reference else{return nil}
+    let along=(turn*reference).sum()
+    guard along != 0 else{return nil}
+    return axis == .vertical ? (along>0 ? .flickUp:.flickDown):(along>0 ? .flickRight:.flickLeft)
 }
 
 // Learns a gesture from three of its swing pairs that agree, without knowing its axis first. A burst runs
@@ -286,12 +318,12 @@ struct GestureShortcut:Equatable {
 }
 
 enum GestureAction:Equatable {
-    case nothing,rightClick,playPause,recenter
+    case nothing,click,rightClick,playPause,recenter
     case keys(GestureShortcut)
     static func key(_ code:Int,_ name:String,_ modifiers:NSEvent.ModifierFlags=[])->GestureAction{.keys(GestureShortcut(key:UInt16(code),modifiers:modifiers,name:name))}
     // The choices Settings offers, in order, before a custom shortcut.
     static let presets:[(title:String,action:GestureAction)]=[
-        ("Nothing",.nothing),
+        ("Nothing",.nothing),("Click",.click),
         ("Return",key(kVK_Return,"Return")),("Escape",key(kVK_Escape,"Esc")),("Space",key(kVK_Space,"Space")),
         ("Left Arrow",key(kVK_LeftArrow,"←")),("Right Arrow",key(kVK_RightArrow,"→")),
         ("Up Arrow",key(kVK_UpArrow,"↑")),("Down Arrow",key(kVK_DownArrow,"↓")),
@@ -309,6 +341,7 @@ enum GestureAction:Equatable {
     var stored:[String:Any] {
         switch self {
         case .nothing:return ["kind":"nothing"]
+        case .click:return ["kind":"click"]
         case .rightClick:return ["kind":"rightClick"]
         case .playPause:return ["kind":"playPause"]
         case .recenter:return ["kind":"recenter"]
@@ -317,6 +350,7 @@ enum GestureAction:Equatable {
     }
     init(stored:[String:Any]?) {
         switch stored?["kind"] as? String {
+        case "click":self = .click
         case "rightClick":self = .rightClick
         case "playPause":self = .playPause
         case "recenter":self = .recenter
@@ -332,6 +366,9 @@ enum GestureAction:Equatable {
         switch self {
         case .nothing:return
         case .recenter:recenter()
+        case .click:
+            guard let point else{return}
+            for type in [CGEventType.leftMouseDown,.leftMouseUp]{CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:point,mouseButton:.left)?.post(tap:.cghidEventTap)}
         case .rightClick:
             guard let point else{return}
             for type in [CGEventType.rightMouseDown,.rightMouseUp]{CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:point,mouseButton:.right)?.post(tap:.cghidEventTap)}
@@ -379,19 +416,29 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
             return [(start,-axis,fast,0.2),(start+0.2,axis,slow,0.35)]
         }
     }
-    func run(_ samples:[(Double,SIMD3<Double>)],_ flicks:[CaseGesture:ClosedCaseFlick])->[ClosedCaseFlickDetector.Event] {
+    func run(_ samples:[(Double,SIMD3<Double>)],_ flicks:[FlickAxis:ClosedCaseFlick])->[ClosedCaseFlickDetector.Event] {
         var detector=ClosedCaseFlickDetector();detector.flicks=flicks
         return samples.flatMap{detector.feed(stamp:$0.0,w:$0.1)}
     }
-    func named(_ events:[ClosedCaseFlickDetector.Event])->[CaseGesture]{events.map{if case .flick(let g,_)=$0{return g};return .doubleTap}}
+    func named(_ events:[ClosedCaseFlickDetector.Event])->[FlickAxis]{events.map{if case .flick(let a,_,_)=$0{return a};return .vertical}}
     let up=SIMD3(0.0,1,0),side=SIMD3(1.0,0,0)
-    let both:[CaseGesture:ClosedCaseFlick]=[.yes:ClosedCaseFlick(axis:up,peak:340),.no:ClosedCaseFlick(axis:side,peak:340)]
-    guard named(run(motion(3,nod(up)),both))==[.yes],named(run(motion(3,nod(side,fast:700)),both))==[.no] else{
-        throw LessonError.message("A fast, big nod must be Yes and a fast, big shake No.")
+    let both:[FlickAxis:ClosedCaseFlick]=[.vertical:ClosedCaseFlick(axis:up,peak:340),.horizontal:ClosedCaseFlick(axis:side,peak:340)]
+    guard named(run(motion(3,nod(up)),both))==[.vertical],named(run(motion(3,nod(side,fast:700)),both))==[.horizontal] else{
+        throw LessonError.message("A fast, big flick up and back must be vertical, and one to the side horizontal.")
     }
-    guard named(run(motion(5,nod(up,cycles:5)),both))==[.yes] else{throw LessonError.message("Nodding several times must be one Yes.")}
+    guard named(run(motion(5,nod(up,cycles:5)),both))==[.vertical] else{throw LessonError.message("Flicking several times in a row must count once.")}
+    // Direction: `nod` swings against its axis first, so a nod about +up is a flick down, about -up a flick up.
+    func direction(_ plan:[Plan])->CaseGesture? {
+        guard case .flick(let axis,let turn,_)? = run(motion(3,plan),both).first else{return nil}
+        return closedCaseFlickGesture(axis,turn:turn,up:up,right:side)
+    }
+    let down=direction(nod(up)),upward=direction(nod(-up)),left=direction(nod(side,fast:600)),right=direction(nod(-side,fast:600))
+    guard down == .flickDown,upward == .flickUp,left == .flickLeft,right == .flickRight else{
+        throw LessonError.message("A flick’s first swing must say up, down, left or right.")
+    }
+    guard closedCaseFlickGesture(.vertical,turn:up,up:nil,right:side)==nil else{throw LessonError.message("Without calibration a flick has no direction.")}
     // Sensor seconds: the nod's first swing starts 1 s into a stream stamped from 1000 s.
-    guard case .flick(_,let since)? = run(motion(3,nod(up)),both).first,abs(since-1001)<0.02 else{
+    guard case .flick(_,_,let since)? = run(motion(3,nod(up)),both).first,abs(since-1001)<0.02 else{
         throw LessonError.message("A gesture must say when it began, so the pointer can go back there: \(String(describing:run(motion(3,nod(up)),both).first)).")
     }
     guard run(motion(3,nod(up,fast:260,slow:200)),both).isEmpty else{throw LessonError.message("A slow nod must not count.")}
@@ -400,7 +447,7 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
     let diagonal=(up+side)/length(up+side)
     guard run(motion(3,nod(diagonal)),both).isEmpty else{throw LessonError.message("A nod between the two axes must count as neither.")}
     guard run(motion(3,nod(up),drift:SIMD3(0,0,90)),both).isEmpty else{throw LessonError.message("A nod that doesn’t start from a steady aim must not count.")}
-    var detail="nods and shakes at 340°/s or more, one per burst, not slow, small, one-way, diagonal or unsteady ones"
+    var detail="flicks at 340°/s or more, up, down, left and right by their first swing, one per burst, not slow, small, one-way, diagonal or unsteady ones"
     if let fixtures {
         // The recorded natural nod and shake: their own axes, then one Yes and one No.
         let gestures=try loadClosedCaseTapFixtures(fixtures.deletingLastPathComponent().appendingPathComponent("GestureFixtures.csv"))
@@ -411,8 +458,8 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
         let nodRows=try gyro("nod"),shakeRows=try gyro("shake")
         guard let yesAxis=ClosedCaseFlickLearner.principalAxis(nodRows.map(\.1).filter{length($0)>=40}),
               let noAxis=ClosedCaseFlickLearner.principalAxis(shakeRows.map(\.1).filter{length($0)>=40}) else{throw LessonError.message("The recorded gestures have no axis.")}
-        let taught:[CaseGesture:ClosedCaseFlick]=[.yes:ClosedCaseFlick(axis:yesAxis,peak:ClosedCaseFlickDetector.defaultPeak),.no:ClosedCaseFlick(axis:noAxis,peak:ClosedCaseFlickDetector.defaultPeak)]
-        guard named(run(nodRows,taught))==[.yes],named(run(shakeRows,taught))==[.no] else{
+        let taught:[FlickAxis:ClosedCaseFlick]=[.vertical:ClosedCaseFlick(axis:yesAxis,peak:ClosedCaseFlickDetector.defaultPeak),.horizontal:ClosedCaseFlick(axis:noAxis,peak:ClosedCaseFlickDetector.defaultPeak)]
+        guard named(run(nodRows,taught))==[.vertical],named(run(shakeRows,taught))==[.horizontal] else{
             throw LessonError.message("The recorded nod must be one Yes and the recorded shake one No: got \(named(run(nodRows,taught))) and \(named(run(shakeRows,taught))).")
         }
         var learner=ClosedCaseFlickLearner(),taughtYes:ClosedCaseFlick?
@@ -425,7 +472,7 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
         for _ in 0..<24 {
             var a=SIMD3(random(),random(),random());a/=length(a)
             var b=SIMD3(random(),random(),random());b-=a*(a*b).sum();b/=length(b)
-            let flicks:[CaseGesture:ClosedCaseFlick]=[.yes:ClosedCaseFlick(axis:a,peak:ClosedCaseFlickDetector.defaultPeak),.no:ClosedCaseFlick(axis:b,peak:ClosedCaseFlickDetector.defaultPeak)]
+            let flicks:[FlickAxis:ClosedCaseFlick]=[.vertical:ClosedCaseFlick(axis:a,peak:ClosedCaseFlickDetector.defaultPeak),.horizontal:ClosedCaseFlick(axis:b,peak:ClosedCaseFlickDetector.defaultPeak)]
             for segment in segments {
                 let rows:[[Double]]=segment.rows.filter{$0[1]==12}.sorted{$0[2]<$1[2]}
                 let samples:[(Double,SIMD3<Double>)]=rows.map{row in (row[2],SIMD3<Double>(row[4],row[5],row[6])*1e-5)}

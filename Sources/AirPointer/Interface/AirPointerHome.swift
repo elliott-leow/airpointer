@@ -26,9 +26,10 @@ struct PointerSettingsState:Equatable {
     var clickSound=true
     // The way this person's taps push the sensor, when setup learned one other than the usual.
     var tapDirection:[Double]?=nil
-    // What each gesture does (nothing until chosen), and the Yes and No flicks Settings taught.
+    // What each gesture does when it isn't its standard (a tap clicks, the rest do nothing), and the flick
+    // axes Settings taught.
     var gestureActions:[CaseGesture:GestureAction]=[:]
-    var taughtFlicks:[CaseGesture:ClosedCaseFlick]=[:]
+    var taughtFlicks:[FlickAxis:ClosedCaseFlick]=[:]
 
     // Slider legacy: 10…60 stored as pointerSensitivity; speed is that value / 25.
     private static let sensitivityKey="pointerSensitivity"
@@ -52,9 +53,9 @@ struct PointerSettingsState:Equatable {
         value.tapDirection=(UserDefaults.standard.array(forKey:tapDirectionKey) as? [Double]).flatMap{$0.count==3 ? $0:nil}
         let actions=UserDefaults.standard.dictionary(forKey:gestureActionsKey) ?? [:],flicks=UserDefaults.standard.dictionary(forKey:taughtFlicksKey) ?? [:]
         for gesture in CaseGesture.allCases {
-            let action=GestureAction(stored:actions[gesture.rawValue] as? [String:Any]);if action != .nothing{value.gestureActions[gesture]=action}
-            if let flick=ClosedCaseFlick(stored:flicks[gesture.rawValue] as? [Double]){value.taughtFlicks[gesture]=flick}
+            if let stored=actions[gesture.rawValue] as? [String:Any]{let action=GestureAction(stored:stored);if action != gesture.standard{value.gestureActions[gesture]=action}}
         }
+        for axis in FlickAxis.allCases{if let flick=ClosedCaseFlick(stored:flicks[axis.rawValue] as? [Double]){value.taughtFlicks[axis]=flick}}
         if let saved=UserDefaults.standard.object(forKey:screenKey) as? Int{value.screen=max(0,saved)}
         value.screenID=UserDefaults.standard.string(forKey:screenIDKey)
         return value
@@ -66,7 +67,7 @@ struct PointerSettingsState:Equatable {
         UserDefaults.standard.set(min(60,max(10,speed*25)),forKey:Self.sensitivityKey)
         UserDefaults.standard.set(clickSound,forKey:Self.clickSoundKey)
         if let tapDirection{UserDefaults.standard.set(tapDirection,forKey:Self.tapDirectionKey)}else{UserDefaults.standard.removeObject(forKey:Self.tapDirectionKey)}
-        UserDefaults.standard.set(Dictionary(uniqueKeysWithValues:gestureActions.filter{$0.value != .nothing}.map{($0.key.rawValue,$0.value.stored)}),forKey:Self.gestureActionsKey)
+        UserDefaults.standard.set(Dictionary(uniqueKeysWithValues:gestureActions.filter{$0.value != $0.key.standard}.map{($0.key.rawValue,$0.value.stored)}),forKey:Self.gestureActionsKey)
         UserDefaults.standard.set(Dictionary(uniqueKeysWithValues:taughtFlicks.map{($0.key.rawValue,$0.value.stored)}),forKey:Self.taughtFlicksKey)
         UserDefaults.standard.set(screen,forKey:Self.screenKey)
         if let screenID{UserDefaults.standard.set(screenID,forKey:Self.screenIDKey)}else{UserDefaults.standard.removeObject(forKey:Self.screenIDKey)}
@@ -89,8 +90,8 @@ func runPointerSettingsChecks()throws {
         throw LessonError.message("Default pointer settings should be speed 1, click sound on, screen 0.")
     }
     var sample=PointerSettingsState(screen:1,screenID:"side",speed:1.4,clickSound:false,tapDirection:[0.6,0,-0.8])
-    sample.gestureActions=[.yes:GestureAction.presets[1].action,.doubleTap:.keys(GestureShortcut(key:40,modifiers:[.command,.shift],name:"K"))]
-    sample.taughtFlicks=[.no:ClosedCaseFlick(axis:SIMD3(0,1,0),peak:360)]
+    sample.gestureActions=[.flickUp:GestureAction.presets.first{$0.title=="Page Up"}!.action,.tap:.nothing,.doubleTap:.keys(GestureShortcut(key:40,modifiers:[.command,.shift],name:"K"))]
+    sample.taughtFlicks=[.horizontal:ClosedCaseFlick(axis:SIMD3(0,1,0),peak:360)]
     sample.clampSpeed();sample.persist()
     let loaded=PointerSettingsState.loadPersisted()
     guard abs(loaded.speed-1.4)<1e-9,!loaded.clickSound,loaded.screen==1,loaded.screenID=="side",loaded.tapDirection==[0.6,0,-0.8],
@@ -271,7 +272,7 @@ final class AirPointerHome:NSObject,NSWindowDelegate {
     var onDisconnect:(()->Void)?
     var onSetup:(()->Void)?
     var onTeachTap:(()->Void)?
-    var onTeachGesture:((CaseGesture)->Void)?
+    var onTeachGesture:((FlickAxis)->Void)?
     var onSettings:(()->Void)?
     var onPointerSettingsChange:((PointerSettingsState)->Void)?
     var onClose:(()->Void)?
@@ -535,10 +536,13 @@ private final class SettingsPage:NSObject {
     private let speedValue=rkLabel("1.0×",13,.medium)
     private var gestureControls:[CaseGesture:GestureActionControl]=[:]
     private static let gestureCaptions:[CaseGesture:String]=[
-        .yes:"Nod the case, fast and big.",
-        .no:"Shake the case side to side, fast and big.",
-        .doubleTap:"Tap the front twice. While this does something, one tap clicks a moment later.",
+        .tap:"Tap the front of the case.",
+        .doubleTap:"Tap the front twice. While this does something, a single tap waits a moment to be sure.",
+        .flickUp:"Flick the case up and back, fast and big.",.flickDown:"Flick the case down and back, fast and big.",
+        .flickLeft:"Flick the case left and back, fast and big.",.flickRight:"Flick the case right and back, fast and big.",
     ]
+    // Teaching follows each pair of flicks.
+    private static let teachRows:[CaseGesture:FlickAxis]=[.flickDown:.vertical,.flickRight:.horizontal]
 
     init(home:AirPointerHome) {
         self.home=home
@@ -581,9 +585,9 @@ private final class SettingsPage:NSObject {
             gestureControls[gesture]=control
             // The movement in a line, with Teach under it; what it does on the right, like every setting.
             let detail=rkVStack([note],spacing:8,align:.leading)
-            if gesture != .doubleTap {
-                let teach=RemoteButton("Teach \(gesture.title)…",style:.secondary,height:28,target:self,action:#selector(teachGesture(_:)))
-                teach.identifier=NSUserInterfaceItemIdentifier(gesture.rawValue)
+            if let axis=Self.teachRows[gesture] {
+                let teach=RemoteButton("Teach \(axis.title)…",style:.secondary,height:28,target:self,action:#selector(teachGesture(_:)))
+                teach.identifier=NSUserInterfaceItemIdentifier(axis.rawValue)
                 detail.addArrangedSubview(teach)
             }
             let row=hmSettingRow(gesture.title,detail:detail,control)
@@ -615,13 +619,13 @@ private final class SettingsPage:NSObject {
         rkSetText(speedValue,String(format:"%.1f×",state.speed))
         speed.setAccessibilityValueDescription(String(format:"%.1f times normal speed",state.speed))
         clickSound.setOn(state.clickSound,animated:false)
-        for (gesture,control) in gestureControls{control.set(state.gestureActions[gesture] ?? .nothing)}
+        for (gesture,control) in gestureControls{control.set(state.gestureActions[gesture] ?? gesture.standard)}
     }
     @objc private func changed(_ sender:Any?) {
         var value=home.pointerSettings
         value.screen=max(0,screens.indexOfSelectedItem);value.speed=(speed.doubleValue*10).rounded()/10;value.clickSound=clickSound.isOn
         if !value.pairs.isEmpty{value.pair=pairs.indexOfSelectedItem-(value.pair<0 ? 1:0)}
-        for (gesture,control) in gestureControls{value.gestureActions[gesture]=control.action == .nothing ? nil:control.action}
+        for (gesture,control) in gestureControls{value.gestureActions[gesture]=control.action == gesture.standard ? nil:control.action}
         home.changePointerSettings(value)
     }
     @objc private func backPressed(){home.present(.pointer)}
@@ -629,6 +633,6 @@ private final class SettingsPage:NSObject {
     @objc private func setup(){home.onSetup?()}
     @objc private func teachTap(){home.onTeachTap?()}
     @objc private func teachGesture(_ sender:NSButton){
-        if let raw=sender.identifier?.rawValue,let gesture=CaseGesture(rawValue:raw){home.onTeachGesture?(gesture)}
+        if let raw=sender.identifier?.rawValue,let axis=FlickAxis(rawValue:raw){home.onTeachGesture?(axis)}
     }
 }

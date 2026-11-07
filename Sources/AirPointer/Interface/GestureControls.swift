@@ -115,10 +115,10 @@ final class GestureDots:NSView {
     }
 }
 
-// Teaching Yes or No: a sheet on the main window that fills a dot for each flick, then learns the movement.
-// One primary: Done once learned, Try Again after a failure; Cancel otherwise.
+// Teaching the flicks of one axis: a sheet on the main window that fills a dot for each flick, then learns the
+// line they swing along and how fast. One primary: Done once learned, Try Again after a failure; Cancel otherwise.
 final class GestureTeachSheet:NSObject {
-    let gesture:CaseGesture
+    let axis:FlickAxis
     let window:NSWindow
     var onDone:(()->Void)?,onCancel:(()->Void)?,onRetry:(()->Void)?
     private let title=rkLabel("",17,.semibold)
@@ -127,18 +127,17 @@ final class GestureTeachSheet:NSObject {
     private let note=rkWrap("",12,.secondaryLabelColor)
     private lazy var cancel=RemoteButton("Cancel",style:.secondary,height:32,target:self,action:#selector(cancelPressed))
     private lazy var primary=RemoteButton("Listening…",style:.primary,height:32,target:self,action:#selector(primaryPressed))
-    // learned carries what the gesture now does, so the sheet can say it.
-    enum State:Equatable{case listening(heard:Int,mixed:Bool,slow:Bool),learned(GestureAction),failed(String),unavailable(String)}
+    enum State:Equatable{case listening(heard:Int,mixed:Bool,slow:Bool),learned,failed(String),unavailable(String)}
     private(set) var state=State.listening(heard:0,mixed:false,slow:false)
 
-    init(gesture:CaseGesture) {
-        self.gesture=gesture
+    init(axis:FlickAxis) {
+        self.axis=axis
         window=NSWindow(contentRect:NSRect(x:0,y:0,width:420,height:290),styleMask:[.titled],backing:.buffered,defer:false)
         super.init()
-        window.title="Teach \(gesture.title)"
+        window.title="Teach \(axis.title)"
         let root=RemoteSurface(HomePalette.canvas)
-        rkSetText(title,"Teach \(gesture.title)")
-        rkSetText(body,"\(gesture.movement) Each \(gesture == .no ? "shake":"nod") fills a dot, all in one go or with pauses. The pointer pauses while you teach it.")
+        rkSetText(title,"Teach \(axis.title)")
+        rkSetText(body,"\(axis.movement) Each flick fills a dot, all in one go or with pauses. The pointer pauses while you teach it.")
         let buttons=rkHStack([rkSpacer(),cancel,primary],spacing:8)
         let stack=rkVStack([title,body,dots,note,buttons],spacing:12,align:.leading)
         stack.setCustomSpacing(20,after:body);stack.setCustomSpacing(20,after:dots);stack.setCustomSpacing(20,after:note)
@@ -161,11 +160,10 @@ final class GestureTeachSheet:NSObject {
         switch state {
         case .listening(let heard,let mixed,let slow):
             dots.heard=heard;primary.title="Listening…";primary.isEnabled=false
-            let verb=gesture == .no ? "Shake":"Nod"
-            rkSetText(note,slow ? "\(verb) faster and bigger.":mixed ? "\(verb) the same way each time.":"Hold the case upright, the way you point with it.")
-        case .learned(let action):
+            rkSetText(note,slow ? "Flick faster and bigger.":mixed ? "Flick along the same line each time.":"Hold the case upright, the way you point with it.")
+        case .learned:
             dots.heard=dots.count;primary.title="Done";cancel.isHidden=true
-            rkSetText(note,action == .nothing ? "Learned. Now choose what \(gesture.title) does.":"Learned. \(gesture.title) now does \(action.title).")
+            rkSetText(note,"Learned. Choose what each flick does in Settings.")
         case .failed(let reason):
             dots.heard=0;primary.title="Try Again";rkSetText(note,reason)
         case .unavailable(let reason):

@@ -329,7 +329,7 @@ func runHomeChecks()throws {
         sample.window.appearance=NSAppearance(named:.aqua)
         // The whole Settings page at once, with gestures given actions, one of them a custom shortcut.
         var gestures=PointerSettingsState(screens:["Built-in Retina Display","Projector"],screen:1,speed:1.4)
-        gestures.gestureActions=[.yes:GestureAction.presets[1].action,.doubleTap:.keys(GestureShortcut(key:40,modifiers:[.command,.shift],name:"K"))]
+        gestures.gestureActions=[.flickUp:GestureAction.presets.first{$0.title=="Page Up"}!.action,.flickRight:GestureAction.presets.first{$0.title=="Right Arrow"}!.action,.doubleTap:.keys(GestureShortcut(key:40,modifiers:[.command,.shift],name:"K"))]
         sample.updatePointerSettings(gestures)
         sample.window.setFrame(NSRect(origin:sample.window.frame.origin,size:NSSize(width:size.width,height:1500)),display:false)
         try render("settings-full",from:sample)
@@ -365,10 +365,10 @@ func runHomeChecks()throws {
         setup.update(SetupState(link:.holdStill,holdProgress:0.62));try windowSnapshot("setup-hold-still",setup.window,.aqua)
         setup.update(SetupState(link:.connected));try windowSnapshot("setup-connected",setup.window,.aqua)
         // Teaching a gesture: listening with one flick heard, learned, and turned down.
-        let teach=GestureTeachSheet(gesture:.yes)
+        let teach=GestureTeachSheet(axis:.vertical)
         teach.update(.listening(heard:1,mixed:false,slow:false));try windowSnapshot("gesture-teach-listening",teach.window,.aqua)
-        teach.update(.learned(GestureAction.presets[1].action));try windowSnapshot("gesture-teach-learned",teach.window,.darkAqua)
-        teach.update(.failed("That’s the same movement as No. "+CaseGesture.yes.movement));try windowSnapshot("gesture-teach-failed",teach.window,.aqua)
+        teach.update(.learned);try windowSnapshot("gesture-teach-learned",teach.window,.darkAqua)
+        teach.update(.failed("That’s the same line as Left and Right. "+FlickAxis.vertical.movement));try windowSnapshot("gesture-teach-failed",teach.window,.aqua)
         // The two moving steps as contact sheets, to check timing and direction.
         for (name,step,times) in [("case-steps-opening",CaseStep.opening,[0.0,0.8,1.0,1.2,1.4,1.6,3.2]),("case-steps-open",.open,[0.0,0.4,0.6,0.8,1.0,1.2,2.0]),("case-steps-close",.close,[0.0,0.8,1.0,1.2,1.4,1.6,3.2]),("case-steps-turn",.turn,[0.0,0.9,1.1,1.3,1.5,1.7,3.4])] {
             let row=NSView(frame:NSRect(x:0,y:0,width:CGFloat(times.count)*200,height:200))

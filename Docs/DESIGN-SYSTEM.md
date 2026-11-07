@@ -31,15 +31,16 @@ Never show or describe tapping the back of the case, holding the open case uprig
 
 **There are no modes.** The closed case is the only pointer, from its motion and taps alone. A single tap on its front left-clicks whenever the pointer is pointing, and Pause or fn ⌃ stops tapping along with the cursor. Never mention the microphone in the product. The only sounds are the tap’s click and the notch’s shimmer (below).
 
-**Gestures** (Settings ▸ Gestures) do nothing until someone gives them an action, so nobody sets one off by surprise. There are three, chosen so none can pass for another or for pointing:
+**Gestures** (Settings ▸ Gestures) map the case's own movements to actions. A tap clicks unless it's mapped to something else; the others do nothing until given an action, so nobody sets one off by surprise. There are six, chosen so none can pass for another or for pointing:
 
 | Gesture | Movement | Why it can't be mistaken |
 |---|---|---|
-| Yes | A fast, big nod, once or several times | A swing and its return about the nod's axis: the faster at 340°/s or more (70% of the person's own once taught), the slower at least a third of it, both 15° or more and one 30° or more, from a steady aim |
-| No | A fast, big shake, once or several times | The same about the shake's axis. A swing counts for whichever axis it fits clearly better, and teaching refuses a No that matches Yes |
-| Double tap | Two taps on the front within 0.35 s | While it has an action, a single tap clicks 0.35 s later; without one, taps click at once |
+| Tap | A tap on the front | The tap detector (§ The tap's click) |
+| Double tap | Two taps within 0.35 s | While it has an action, a single tap waits 0.35 s; without one, taps act at once |
+| Flick up / down | A fast, big swing up (or down) and back, once or several times | The swing and its return about the up-and-down axis: the faster at 340°/s or more (70% of the person's own once taught), the slower at least a third of it, both 15° or more and one 30° or more, from a steady aim. Up or down is the first swing's direction against the calibrated up |
+| Flick left / right | The same, side to side | The same about the left-and-right axis, against the calibrated right. A flick counts for whichever axis it fits clearly better, and teaching refuses an axis that matches the other |
 
-Aiming never swings that fast and that far back and forth, and a tap is a 20 ms twitch. Nodding several times is one Yes: nothing more counts until the case settles. Yes and No each have a **Teach…** sheet: each nod or shake fills a dot, so a natural “yes, yes, yes” teaches it in one go, and three that agree set the axis and the speed; untaught, they use the calibrated up and right axes. A gesture that lands is confirmed in the HUD (“Yes · Return”), and the pointer goes back to where it was when the gesture began. Actions are a preset key or click, or a custom shortcut; a custom shortcut can't be the pointer shortcut, one another gesture sends, or one that quits, closes or locks things.
+Aiming never swings that fast and that far back and forth, and a tap is a 20 ms twitch. Flicking several times in a row is one flick: nothing more counts until the case settles. Each axis has a **Teach…** sheet (Teach Up and Down…, Teach Left and Right…): each flick fills a dot, so three in one go or with pauses set the axis and the speed; untaught, flicks use the calibrated up and right axes. A gesture that lands is confirmed in the HUD (“Flick up · Page Up”), and the pointer goes back to where it was when the flick began. Actions are a preset key or click, or a custom shortcut; a custom shortcut can't be the pointer shortcut, one another gesture sends, or one that quits, closes or locks things.
 
 ## 3. Surfaces
 
@@ -50,7 +51,7 @@ Aiming never swings that fast and that far back and forth, and a tap is a 20 ms 
 | Main window ("Remote") | Two pages, **Pointer** and **Settings**, and no section tabs: the toolbar is only the gear. Settings opens with a "‹ Pointer" back button; esc and ⌘1 also go back. Pages scroll; a notice bar sits above them. | 440 × 700, min 400 × 620, max width 560 |
 | Menu-bar popover | Live aim pad, Recenter, Pause, speed, then menu rows: Open AirPointer, Calibrate…, Disconnect (only while the closed case is connected), Settings…, Quit. | 320 wide |
 | Control HUD | A small non-activating capsule: "Pointing", "Paused — reason", "Disconnected — connect again, then open the lid", "Pointer stopped — allow AirPointer in Accessibility". | 40 tall, ≤ 480 wide |
-| Sheets | Attached to the main window, for a task that starts there. **Teach Yes / Teach No** (Settings ▸ Gestures ▸ Teach…): the movement in one line, three dots that fill as the person nods or shakes, a note (faster and bigger, the same way each time), and one primary: Listening… (disabled), then Done, or Try Again after a mixed or doubled-up movement. The pointer pauses while it's open. | 420 × 290 |
+| Sheets | Attached to the main window, for a task that starts there. **Teach Up and Down / Teach Left and Right** (Settings ▸ Gestures): the movement in one line, three dots that fill as the person flicks, a note (faster and bigger, the same line each time), and one primary: Listening… (disabled), then Done, or Try Again after a mixed or doubled-up movement. The pointer pauses while it's open. | 420 × 290 |
 | Developer tools | Keep audio on Mac and the tap test window. Under **File ▸ Developer** only; never linked from the main flows. The test window uses the same parts as the product: a DEVELOPER eyebrow and status chip, a 22 pt title, one primary bottom-right. | 480 × 440 |
 
 A flow should never open a second regular window to finish a task that started in the main window. Use the overlay, a sheet, or the page itself.
@@ -178,7 +179,7 @@ Wrapping text uses `rkWrap` (a `RemoteWrappingLabel`, which tracks its own width
 | `CalibrationOverlayView` | Full-screen dwell calibration. | Step, progress ring, hint, success state. |
 | `MenuRow` | Popover menu rows. | n/a |
 | `GestureActionControl` | What a gesture does: presets, then Custom Shortcut…, which records the next key pressed. | Turns down a shortcut with the reason in the row's caption, and keeps the old choice. |
-| `GestureTeachSheet`, `GestureDots` | Teaching Yes or No. | Ink dots on the canvas; one primary. |
+| `GestureTeachSheet`, `GestureDots` | Teaching the flicks of one axis. | Ink dots on the canvas; one primary. |
 
 When a system control can't meet the rules in §4 (blue, translucent), draw a small custom control here, with accessibility, keyboard and focus-ring support, instead of restyling it locally.
 
