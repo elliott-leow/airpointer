@@ -516,7 +516,10 @@ final class ClosedCaseSession: NSObject {
     // A tap clicks unless Settings maps it to something else.
     private var tapClicks:Bool{(gestureActions[.tap] ?? .click) == .click}
     private var flickDetector=ClosedCaseFlickDetector(),flickLearner:ClosedCaseFlickLearner?,onFlickLearning:((ClosedCaseFlickLearner.Event)->Void)?
-    private var doubleTap=ClosedCaseDoubleTap(),glide=ClosedCaseCursorGlide(),gestureHoldUntil=0.0,lastPointUpdate=0.0
+    private var doubleTap=ClosedCaseDoubleTap(),gestureHoldUntil=0.0,lastPointUpdate=0.0
+    // The cursor itself, moved once per display refresh on its own thread (ClosedCaseCursorOutput).
+    private let cursor=ClosedCaseCursorOutput()
+    private var cursorFrames=0
     // Teaching a flick needs live motion with the gyro's offset known; the pointer can be paused.
     var canTeachFlicks:Bool{inputReady && motion?.fusionReady==true}
     func learnFlick(_ handler:@escaping(ClosedCaseFlickLearner.Event)->Void){flickLearner=ClosedCaseFlickLearner();onFlickLearning=handler}
@@ -637,7 +640,7 @@ final class ClosedCaseSession: NSObject {
         return true
     }
     private func finishCalibration(resume:Bool){
-        calibrated=true;hasPointed=false;smooth=CGPoint(x:0.5,y:0.5);pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil;setAim(smooth);glide.reset()
+        calibrated=true;hasPointed=false;smooth=CGPoint(x:0.5,y:0.5);pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil;setAim(smooth);cursor.with{$0.reset()}
         step("pointing")
         readStatus()
         if resume || pointsWhenReady{resumeAfterDrop=false;toggleCursor()}
@@ -673,7 +676,7 @@ final class ClosedCaseSession: NSObject {
         if let savedGrip=cachedGrip{motion?.loadGrip(savedGrip)}
         calibrated=false;generation=0;lastHost=0;pending=Data();smooth=CGPoint(x:0.5,y:0.5)
         pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil
-        setAim(smooth);glide.reset();flickDetector.reset();doubleTap.reset();feedError=nil;savedMeasure=0
+        setAim(smooth);cursor.with{$0.reset()};flickDetector.reset();doubleTap.reset();feedError=nil;savedMeasure=0
     }
     private func saveCalibration(){
         guard let motion,motion.measured>savedMeasure,let values=motion.calibrationValues,let targetHash else{return}
@@ -964,7 +967,7 @@ final class ClosedCaseSession: NSObject {
                 let resume=enabled || resumeAfterDrop
                 motion.resetGrip(keepingEdges:true)
                 generation=nextGeneration;calibrated=false;pause();resumeAfterDrop=resume
-                smooth=CGPoint(x:0.5,y:0.5);setAim(smooth);glide.reset();flickDetector.reset()
+                smooth=CGPoint(x:0.5,y:0.5);setAim(smooth);cursor.with{$0.reset()};flickDetector.reset()
                 pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil;recentPoints=[];tapHold=nil;settle=nil
             }
             guard host>lastHost,abs(host-accelHost)<0.25 else{return}
@@ -985,13 +988,13 @@ final class ClosedCaseSession: NSObject {
             // The filter follows the case even while a click or flick holds the pointer, so when it's let go
             // the pointer stays put and the case's aim carries on from there.
             let aim=pointerFilter.feed(CGPoint(x:min(1,max(0,x)),y:min(1,max(0,y))),at:stamp*1e-6)
-            if let tapHold{smooth=tapHold;anchorAt=tapHold;glide.snap(tapHold,at:now)}
-            else if now<gestureHoldUntil{anchorAt=smooth;glide.snap(smooth,at:now)}
+            if let tapHold{smooth=tapHold;anchorAt=tapHold;cursor.with{$0.hold(tapHold,at:now)}}
+            else if now<gestureHoldUntil{anchorAt=smooth;cursor.with{$0.hold(smooth,at:now)}}
             else{
                 if let anchorAt{anchor.anchor(aim,at:anchorAt);self.anchorAt=nil}
                 smooth=anchor.apply(aim,at:stamp*1e-6)
                 recentPoints.append((stamp*1e-6,smooth));while let first=recentPoints.first,stamp*1e-6-first.t>0.5{recentPoints.removeFirst()}
-                glide.aim(smooth,at:now)
+                cursor.with{$0.aim(smooth,at:now)}
             }
         }
     }
@@ -1000,7 +1003,8 @@ final class ClosedCaseSession: NSObject {
         let now=ProcessInfo.processInfo.systemUptime
         readStats.count+=1;readStats.total+=now-start;readStats.longest=max(readStats.longest,now-start)
         if now-readStats.since>=10{
-            try? log?.write(contentsOf:Data(String(format:"READS %d, mean %.1f ms, longest %.1f ms\n",readStats.count,1e3*readStats.total/Double(readStats.count),1e3*readStats.longest).utf8))
+            let frames=cursor.frames,rate=Double(frames-cursorFrames)/max(0.001,now-readStats.since);cursorFrames=frames
+            try? log?.write(contentsOf:Data(String(format:"READS %d, mean %.1f ms, longest %.1f ms; cursor %.0f frames/s%@\n",readStats.count,1e3*readStats.total/Double(readStats.count),1e3*readStats.longest,rate,cursor.linked ? " from the display":" from the timer").utf8))
             readStats=(0,0,0,now)
         }
     }
@@ -1012,7 +1016,7 @@ final class ClosedCaseSession: NSObject {
         pause()
         _=motion.run("rawGrip.center=[...rawFusion.q]")
         if motion.lastException != nil{feedError=nil;return}
-        smooth=CGPoint(x:0.5,y:0.5);pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil;setAim(smooth);glide.reset();readStatus()
+        smooth=CGPoint(x:0.5,y:0.5);pointerFilter=ClosedCasePointerFilter();anchor.reset();anchorAt=nil;setAim(smooth);cursor.with{$0.reset()};readStatus()
         saveCalibration()
     }
     private func toggleCursor(){
@@ -1022,16 +1026,26 @@ final class ClosedCaseSession: NSObject {
             AccessibilityGuide.shared.open();return
         }
         enabled=true;hasPointed=true;resumeAfterDrop=false;if clickSound{TapClickSound.shared.start()}
+        // Pointing starts from wherever the cursor is, and glides to the aim.
+        if let bounds=pointerBounds(),let location=CGEvent(source:nil)?.location {
+            let start=CGPoint(x:min(1,max(0,(location.x-bounds.minX-1)/max(1,bounds.width-2))),y:min(1,max(0,(location.y-bounds.minY-1)/max(1,bounds.height-2))))
+            let now=ProcessInfo.processInfo.systemUptime
+            cursor.with{$0.place(start,at:now);$0.reset()}
+        }
         changed()
     }
-    // Every 5 ms: the cursor eases toward the latest aim (ClosedCaseCursorGlide), and a tap whose double-tap
-    // window has passed clicks.
+    // Every 5 ms: a tap whose double-tap window has passed clicks, and the cursor learns where to post and for
+    // how long motion is fresh. The display link moves it; without one, this steps it.
     private func stepCursor(_ now:Double){
         if let point=doubleTap.expire(now:now),enabled{tapAfterWindow(point)}
-        guard calibrated,let point=glide.step(at:now) else{return}
+        let bounds=pointerBounds()
+        if enabled,bounds==nil{pause()}
+        cursor.configure(screen:pointerScreen(),bounds:enabled ? bounds:nil,postUntil:enabled && calibrated ? lastHost+0.25:0)
+        guard calibrated else{return}
+        if !cursor.linked{cursor.frame(at:now)}
+        guard let point=cursor.shown else{return}
         setAim(point)
         if now-lastPointUpdate>=1.0/60{lastPointUpdate=now;onPoint?(point)}
-        if enabled && now-lastHost<0.25{postCursor(point)}
     }
     private func tapAfterWindow(_ point:CGPoint){
         performTap(point);if clickSound,tapClicks{TapClickSound.shared.play()}
@@ -1067,10 +1081,9 @@ final class ClosedCaseSession: NSObject {
             for event in flickDetector.feed(stamp:row[2],w:SIMD3(row[4],row[5],row[6])*1e-5-offset){
                 guard case .flick(let axis,let turn,let since)=event,let gesture=closedCaseFlickGesture(axis,turn:turn,up:edge("up"),right:edge("right")) else{continue}
                 guard gestureActions[gesture] ?? .nothing != .nothing else{try? log?.write(contentsOf:Data("gesture: \(gesture.title), which does nothing\n".utf8));continue}
-                // The flick swung the pointer; it goes back to where it was, and holds there a moment.
+                // The flick swung the pointer; it glides back to where it was, and holds there a moment.
                 let at=recentPoints.last{$0.t<since}?.point ?? smooth,now=ProcessInfo.processInfo.systemUptime
-                smooth=at;gestureHoldUntil=now+0.3;glide.snap(at,at:now)
-                if let bounds=pointerBounds(){CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:screenPoint(at,bounds:bounds),mouseButton:.left)?.post(tap:.cghidEventTap)}
+                smooth=at;gestureHoldUntil=now+0.3;cursor.with{$0.move(to:at,at:now)}
                 performGesture(gesture,at:at)
             }
         }
@@ -1081,21 +1094,25 @@ final class ClosedCaseSession: NSObject {
         let action=gestureActions[gesture] ?? .nothing
         try? log?.write(contentsOf:Data("gesture: \(gesture.title) → \(action.title)\n".utf8))
         onGesture?(gesture,action)
-        let position=pointerBounds().map{screenPoint(point,bounds:$0)}
+        let bounds=pointerBounds(),position=bounds.map{screenPoint(point,bounds:$0)}
+        if let bounds,action == .click || action == .rightClick{placeCursor(at:point,bounds:bounds)}
         action.perform(at:position){[weak self] in self?.recenter()}
     }
+    private func pointerScreen()->NSScreen?{NSScreen.screens.indices.contains(screenIndex) ? NSScreen.screens[screenIndex]:nil}
     private func pointerBounds()->CGRect?{
-        guard AXIsProcessTrusted(),NSScreen.screens.indices.contains(screenIndex),
-              let number=NSScreen.screens[screenIndex].deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else{return nil}
+        guard AXIsProcessTrusted(),let number=pointerScreen()?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else{return nil}
         return CGDisplayBounds(CGDirectDisplayID(number.uint32Value))
     }
-    private func postCursor(_ point:CGPoint){
-        guard let bounds=pointerBounds(),
-              let event=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:screenPoint(point,bounds:bounds),mouseButton:.left) else{pause();return}
-        event.post(tap:.cghidEventTap)
+    // A click moves the system cursor to where it lands, so the glide carries on from there. How far that was
+    // goes in the log: a few pixels at most, since a tap holds the cursor from the moment it's heard.
+    private func placeCursor(at point:CGPoint,bounds:CGRect){
+        let now=ProcessInfo.processInfo.systemUptime
+        let was=cursor.with{glide->CGPoint? in let was=glide.shown;glide.place(point,at:now);return was}
+        if let was{let a=screenPoint(was,bounds:bounds),b=screenPoint(point,bounds:bounds);try? log?.write(contentsOf:Data(String(format:"click: cursor %.0f px from where it landed\n",hypot(a.x-b.x,a.y-b.y)).utf8))}
     }
     private func postClick(_ point:CGPoint){
         guard let bounds=pointerBounds() else{pause();return}
+        placeCursor(at:point,bounds:bounds)
         let position=screenPoint(point,bounds:bounds),now=ProcessInfo.processInfo.systemUptime
         let count=lastClick.map{now-$0.uptime<NSEvent.doubleClickInterval && hypot($0.position.x-position.x,$0.position.y-position.y)<8 ? $0.count+1:1} ?? 1
         guard let down=CGEvent(mouseEventSource:nil,mouseType:.leftMouseDown,mouseCursorPosition:position,mouseButton:.left),
@@ -1114,7 +1131,7 @@ final class ClosedCaseSession: NSObject {
     private func finished(_ message:String){
         step("session ended");endMessage=message;preparing=false;signalled=false;endLidWait()
         silentOutput?.stop();silentOutput=nil;TapClickSound.shared.stop();AudioOutputGuard.shared.sessionEnded()
-        pause();timer?.invalidate();timer=nil;try? stream?.close();stream=nil;try? log?.close();log=nil;try? motionRecord?.close();motionRecord=nil
+        pause();cursor.stop();timer?.invalidate();timer=nil;try? stream?.close();stream=nil;try? log?.close();log=nil;try? motionRecord?.close();motionRecord=nil
         if let activity{ProcessInfo.processInfo.endActivity(activity)};activity=nil
         helper=nil;bootstrap=nil;connected=false;ready=false;stopping=false;confirmed=false;held=false
         changed();onEnded?(endReason)

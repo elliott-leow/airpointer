@@ -294,14 +294,19 @@ struct ClosedCaseDoubleTap {
     mutating func reset(){pending=nil}
 }
 
-// Moves the cursor between motion updates. Motion arrives in bursts, often 20-60 ms apart, and posting the
-// cursor only then makes it jump. Each step eases toward the latest aim, carried forward at its recent speed
-// for up to 30 ms, so a short gap keeps moving and a longer one settles where the aim was heading.
+// The cursor's own motion, one step per display refresh (ClosedCaseCursorOutput). Each step eases toward the
+// latest aim (20 ms) and carries it forward at its recent speed for up to 30 ms, so the bursts Bluetooth
+// delivers 20–60 ms apart read as one smooth movement. Nothing it does is a jump: when what it follows jumps
+// (a flick's return, recentering, the first aim once pointing starts), the gap fades over 180 ms, slow at
+// both ends, while the cursor keeps following live motion under it.
 struct ClosedCaseCursorGlide {
-    static let follow=0.02,lead=0.03
-    private(set) var position:CGPoint?
-    private var target:CGPoint?,targetAt=0.0,velocity=CGVector.zero,steppedAt:Double?
+    static let follow=0.02,lead=0.03,blend=0.18
+    // Where the cursor shows now, after the last step.
+    private(set) var shown:CGPoint?
+    private var position:CGPoint?,target:CGPoint?,targetAt=0.0,velocity=CGVector.zero,steppedAt:Double?
+    private var carry=CGVector.zero,carryFrom=0.0,blendNext=false
     mutating func aim(_ point:CGPoint,at now:Double) {
+        if blendNext{blendNext=false;move(to:point,at:now);return}
         if let target,now>targetAt {
             let dt=now-targetAt
             if dt<0.15 {
@@ -312,19 +317,84 @@ struct ClosedCaseCursorGlide {
         }
         target=point;targetAt=now
     }
-    // A held point (a click, a gesture) goes straight there and stays put.
-    mutating func snap(_ point:CGPoint,at now:Double){position=point;target=point;targetAt=now;velocity = .zero;steppedAt=now}
+    // Stay at `point`, as a click does: the cursor eases there and stays put.
+    mutating func hold(_ point:CGPoint,at now:Double){target=point;targetAt=now;velocity = .zero}
+    // Go to `point` without jumping: the gap from where the cursor shows fades over `blend`.
+    mutating func move(to point:CGPoint,at now:Double) {
+        let from=shown ?? point
+        position=point;target=point;targetAt=now;velocity = .zero;steppedAt=now
+        carry=CGVector(dx:from.x-point.x,dy:from.y-point.y);carryFrom=now
+    }
+    // The cursor is at `point` already: where pointing starts from, or where a click put it.
+    mutating func place(_ point:CGPoint,at now:Double){position=point;shown=point;target=point;targetAt=now;velocity = .zero;steppedAt=now;carry = .zero}
+    // What it follows is about to jump (recentering, a new calibration): the next aim glides there.
+    mutating func reset(){velocity = .zero;blendNext=true}
     mutating func step(at now:Double)->CGPoint? {
         guard let target else{return nil}
         let ahead=min(max(now-targetAt,0),Self.lead)
         let goal=CGPoint(x:min(1,max(0,target.x+velocity.dx*ahead)),y:min(1,max(0,target.y+velocity.dy*ahead)))
-        guard let position,let steppedAt else{position=goal;steppedAt=now;return goal}
-        let alpha=1-exp(-max(0,now-steppedAt)/Self.follow)
-        let next=CGPoint(x:position.x+(goal.x-position.x)*alpha,y:position.y+(goal.y-position.y)*alpha)
-        self.position=next;self.steppedAt=now
-        return next
+        var next=goal
+        if let position,let steppedAt {
+            let alpha=1-exp(-max(0,now-steppedAt)/Self.follow)
+            next=CGPoint(x:position.x+(goal.x-position.x)*alpha,y:position.y+(goal.y-position.y)*alpha)
+        }
+        position=next;steppedAt=now
+        // Smoothstep: the gap starts and ends fading at no speed, so the cursor's speed never jumps either.
+        let u=min(1,max(0,(now-carryFrom)/Self.blend)),left=1-u*u*(3-2*u)
+        if u>=1{carry = .zero}
+        let out=CGPoint(x:min(1,max(0,next.x+carry.dx*left)),y:min(1,max(0,next.y+carry.dy*left)))
+        shown=out
+        return out
     }
-    mutating func reset(){position=nil;target=nil;velocity = .zero;steppedAt=nil}
+}
+
+// Moves the cursor once per refresh of the pointer's display (60 Hz here, 120 Hz on ProMotion), from a display
+// link on its own thread, so a busy main thread never holds it up and every frame shows one more step of the
+// glide. The session aims it from the main thread; the lock keeps the two apart. Without a display link, the
+// session's 5 ms timer steps it instead.
+final class ClosedCaseCursorOutput:NSObject {
+    private let lock=NSLock()
+    private var glide=ClosedCaseCursorGlide(),bounds:CGRect?,postUntil=0.0
+    private var link:CADisplayLink?,display:CGDirectDisplayID?,loop:RunLoop?,frameCount=0
+    var linked:Bool{link != nil}
+    // Frames stepped so far, for the session log's rate.
+    var frames:Int{lock.lock();defer{lock.unlock()};return frameCount}
+    func with<T>(_ body:(inout ClosedCaseCursorGlide)->T)->T{lock.lock();defer{lock.unlock()};return body(&glide)}
+    var shown:CGPoint?{with{$0.shown}}
+    // Main thread, every tick: which screen, where it is, and until when to move the cursor (nil bounds: don't).
+    func configure(screen:NSScreen?,bounds:CGRect?,postUntil:Double) {
+        lock.lock();self.bounds=bounds;self.postUntil=postUntil;lock.unlock()
+        let next=(screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber).map{CGDirectDisplayID($0.uint32Value)}
+        guard next != display else{return}
+        display=next;link?.invalidate();link=nil
+        guard let screen,let loop=runLoop() else{return}
+        let created=screen.displayLink(target:self,selector:#selector(refresh(_:)))
+        created.add(to:loop,forMode:.common);link=created
+    }
+    func stop(){display=nil;link?.invalidate();link=nil}
+    // The display link's thread, started once and kept for the session's life.
+    private func runLoop()->RunLoop? {
+        if let loop{return loop}
+        let ready=DispatchSemaphore(value:0);var found:RunLoop?
+        let thread=Thread{
+            found=RunLoop.current
+            RunLoop.current.add(NSMachPort(),forMode:.default)
+            ready.signal()
+            while true{RunLoop.current.run(mode:.default,before:.distantFuture)}
+        }
+        thread.name="AirPointer cursor";thread.qualityOfService = .userInteractive;thread.start()
+        ready.wait();loop=found
+        return found
+    }
+    @objc private func refresh(_ link:CADisplayLink){frame(at:ProcessInfo.processInfo.systemUptime)}
+    // One step of the glide, posted as a mouse move.
+    func frame(at now:Double) {
+        lock.lock()
+        let point=glide.step(at:now),post=now<postUntil ? bounds:nil
+        frameCount+=1
+        lock.unlock()
+        if let point,let post{CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:screenPoint(point,bounds:post),mouseButton:.left)?.post(tap:.cghidEventTap)}
+    }
 }
 
 // MARK: - Actions
@@ -571,7 +641,32 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
     glide.aim(CGPoint(x:0.6,y:0.5),at:0.02)
     let soon=glide.step(at:0.025)?.x ?? 0,later=glide.step(at:0.06)?.x ?? 0,settled=glide.step(at:0.4)?.x ?? 0
     guard soon>0.5,soon<0.6,later>soon,abs(settled-0.66)<0.01 else{throw LessonError.message("The cursor must glide toward the aim and settle a little ahead of a moving aim.")}
-    glide.snap(CGPoint(x:0.1,y:0.1),at:0.5);guard glide.step(at:0.6)==CGPoint(x:0.1,y:0.1) else{throw LessonError.message("A held point must stay put.")}
+    glide.hold(CGPoint(x:0.1,y:0.1),at:0.5);_=glide.step(at:0.55)
+    guard let heldAt=glide.step(at:0.8),abs(heldAt.x-0.1)<1e-6,abs(heldAt.y-0.1)<1e-6 else{throw LessonError.message("A held point must stay put.")}
+    // No jumps: moving across the screen (a flick's return, recentering) glides there over 180 ms at 60 Hz, with no
+    // frame's step much bigger than its neighbours', starting and ending slowly.
+    func frames(_ glide:inout ClosedCaseCursorGlide,from start:Double,count:Int)->[CGPoint]{(1...count).compactMap{glide.step(at:start+Double($0)/60)}}
+    var across=ClosedCaseCursorGlide();across.place(CGPoint(x:0.1,y:0.5),at:0);across.move(to:CGPoint(x:0.9,y:0.5),at:0)
+    let path=[CGPoint(x:0.1,y:0.5)]+frames(&across,from:0,count:15),steps=zip(path,path.dropFirst()).map{$1.x-$0.x}
+    guard steps.allSatisfy({$0 >= -1e-9}),steps.max() ?? 1<0.15,steps.first ?? 1<0.05,abs((path.last?.x ?? 0)-0.9)<1e-6,
+          zip(steps,steps.dropFirst()).allSatisfy({abs($1-$0)<0.06}) else{
+        throw LessonError.message("Moving across the screen must glide, not jump: \(steps.map{String(format:"%.3f",$0)}).")
+    }
+    // The display link steps the cursor once per refresh of the screen, at 60 Hz or more, without posting here.
+    if let screen=NSScreen.main {
+        let output=ClosedCaseCursorOutput()
+        output.configure(screen:screen,bounds:nil,postUntil:0)
+        let began=Date();while Date().timeIntervalSince(began)<0.5{RunLoop.current.run(until:Date().addingTimeInterval(0.05))}
+        let rate=Double(output.frames)/0.5;output.stop()
+        guard output.frames>0,rate>=50,rate<=260 else{throw LessonError.message("The cursor must step once per display refresh, at 60 Hz or more: \(rate) Hz.")}
+        detail+=String(format:"; cursor steps at %.0f Hz with the display",rate)
+    }
+    // A new calibration's first aim glides from where the cursor was, and so does the first aim after placing it
+    // where the system cursor is.
+    var recentred=ClosedCaseCursorGlide();recentred.place(CGPoint(x:0.2,y:0.2),at:0);recentred.reset();recentred.aim(CGPoint(x:0.5,y:0.5),at:0)
+    guard let first=recentred.step(at:1.0/60),first.x<0.25,let last=frames(&recentred,from:1.0/60,count:12).last,abs(last.x-0.5)<1e-6 else{
+        throw LessonError.message("Recentering must glide to the new aim.")
+    }
     // Actions: stored and loaded, and risky or taken shortcuts refused.
     for preset in GestureAction.presets{guard GestureAction(stored:preset.action.stored)==preset.action else{throw LessonError.message("\(preset.title) didn’t round-trip.")}}
     let custom=GestureAction.keys(GestureShortcut(key:UInt16(kVK_ANSI_K),modifiers:[.command,.shift],name:"K"))
@@ -585,5 +680,5 @@ func runClosedCaseGestureChecks(fixtures:URL?) throws -> String {
           GestureShortcut.refusal(custom.shortcut!,pointer:pointer,others:[]) == nil else{
         throw LessonError.message("Gesture shortcuts must refuse quitting, the pointer shortcut and a shortcut another gesture sends.")
     }
-    return "gestures: "+detail+"; double tap; the pointer stays where it clicked until moved; cursor glide; actions stored and risky shortcuts refused"
+    return "gestures: "+detail+"; double tap; the pointer stays where it clicked until moved; cursor glide, with no jumps at 60 Hz; actions stored and risky shortcuts refused"
 }
