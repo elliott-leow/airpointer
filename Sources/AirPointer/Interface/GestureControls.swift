@@ -104,7 +104,7 @@ final class GestureDots:NSView {
     init(count:Int){self.count=count;super.init(frame:.zero);setAccessibilityElement(true);setAccessibilityRole(.image);label()}
     required init?(coder:NSCoder){fatalError("init(coder:) is not used")}
     override var intrinsicContentSize:NSSize{NSSize(width:CGFloat(count)*28+CGFloat(count-1)*20,height:28)}
-    private func label(){setAccessibilityLabel("\(heard) of \(count) flicks heard")}
+    private func label(){setAccessibilityLabel("\(heard) of \(count) heard")}
     override func draw(_ dirtyRect:NSRect) {
         let size:CGFloat=28,gap:CGFloat=20,left=round(bounds.midX-(CGFloat(count)*size+CGFloat(count-1)*gap)/2),y=round(bounds.midY-size/2)
         for index in 0..<count {
@@ -138,7 +138,7 @@ final class GestureTeachSheet:NSObject {
         window.title="Teach \(gesture.title)"
         let root=RemoteSurface(HomePalette.canvas)
         rkSetText(title,"Teach \(gesture.title)")
-        rkSetText(body,"\(gesture.movement) Do it three times, with a short pause between. The pointer pauses while you teach it.")
+        rkSetText(body,"\(gesture.movement) Do it three times, with a pause between. The pointer pauses while you teach it.")
         let buttons=rkHStack([rkSpacer(),cancel,primary],spacing:8)
         let stack=rkVStack([title,body,dots,note,buttons],spacing:12,align:.leading)
         stack.setCustomSpacing(20,after:body);stack.setCustomSpacing(20,after:dots);stack.setCustomSpacing(20,after:note)
@@ -161,7 +161,8 @@ final class GestureTeachSheet:NSObject {
         switch state {
         case .listening(let heard,let mixed,let slow):
             dots.heard=heard;primary.title="Listening…";primary.isEnabled=false
-            rkSetText(note,slow ? "Flick faster: a quick snap of the wrist, then straight back.":mixed ? "Flick the same way each time.":"Hold the case upright, the way you point with it.")
+            let verb=gesture == .no ? "Shake":"Nod"
+            rkSetText(note,slow ? "\(verb) faster and bigger.":mixed ? "\(verb) the same way each time.":"Hold the case upright, the way you point with it.")
         case .learned(let action):
             dots.heard=dots.count;primary.title="Done";cancel.isHidden=true
             rkSetText(note,action == .nothing ? "Learned. Now choose what \(gesture.title) does.":"Learned. \(gesture.title) now does \(action.title).")

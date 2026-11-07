@@ -212,7 +212,7 @@ extension App {
                 self.pointerSettings.taughtFlicks[gesture]=flick;self.pointerSettings.persist()
                 if let session=self.closedCaseSession{self.applyPointerSettings(self.pointerSettings,to:session)}
                 sheet.update(.learned(self.pointerSettings.gestureActions[gesture] ?? .nothing))
-            case .failed:sheet.update(.failed("Those flicks went different ways. \(gesture.movement)"))
+            case .failed:sheet.update(.failed("Those went different ways. \(gesture.movement)"))
             }
         }
     }

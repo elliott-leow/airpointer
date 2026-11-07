@@ -90,7 +90,7 @@ func runPointerSettingsChecks()throws {
     }
     var sample=PointerSettingsState(screen:1,screenID:"side",speed:1.4,clickSound:false,tapDirection:[0.6,0,-0.8])
     sample.gestureActions=[.yes:GestureAction.presets[1].action,.doubleTap:.keys(GestureShortcut(key:40,modifiers:[.command,.shift],name:"K"))]
-    sample.taughtFlicks=[.no:ClosedCaseFlick(axis:SIMD3(0,1,0),peak:180)]
+    sample.taughtFlicks=[.no:ClosedCaseFlick(axis:SIMD3(0,1,0),peak:360)]
     sample.clampSpeed();sample.persist()
     let loaded=PointerSettingsState.loadPersisted()
     guard abs(loaded.speed-1.4)<1e-9,!loaded.clickSound,loaded.screen==1,loaded.screenID=="side",loaded.tapDirection==[0.6,0,-0.8],
@@ -535,8 +535,8 @@ private final class SettingsPage:NSObject {
     private let speedValue=rkLabel("1.0×",13,.medium)
     private var gestureControls:[CaseGesture:GestureActionControl]=[:]
     private static let gestureCaptions:[CaseGesture:String]=[
-        .yes:"Flick the case up and straight back.",
-        .no:"Flick the case to one side and straight back.",
+        .yes:"Nod the case, fast and big.",
+        .no:"Shake the case side to side, fast and big.",
         .doubleTap:"Tap the front twice. While this does something, one tap clicks a moment later.",
     ]
 

@@ -35,11 +35,11 @@ Never show or describe tapping the back of the case, holding the open case uprig
 
 | Gesture | Movement | Why it can't be mistaken |
 |---|---|---|
-| Yes | A fast flick up and straight back | One swing of 150°/s or more, 50–300 ms out and as long back, ending where it began, about the case's up axis |
-| No | A fast flick to one side and straight back | The same, about the side axis. Teaching refuses a No that matches Yes |
+| Yes | A fast, big nod, once or several times | A swing and its return about the nod's axis: the faster at 340°/s or more (70% of the person's own once taught), the slower at least a third of it, both 15° or more and one 30° or more, from a steady aim |
+| No | A fast, big shake, once or several times | The same about the shake's axis. A swing counts for whichever axis it fits clearly better, and teaching refuses a No that matches Yes |
 | Double tap | Two taps on the front within 0.35 s | While it has an action, a single tap clicks 0.35 s later; without one, taps click at once |
 
-Aiming is one sweep, or a sweep with a small correction, and a tap is a 20 ms twitch, so neither is a flick. Yes and No each have a **Teach…** sheet: three flicks that agree teach the axis and the speed (60% of a typical flick, never under 150°/s); untaught, they use the calibrated up and right axes at 200°/s. A gesture that lands is confirmed in the HUD (“Yes · Return”), and a flick puts the pointer back where it was before it began. Actions are a preset key or click, or a custom shortcut; a custom shortcut can't be the pointer shortcut, one another gesture sends, or one that quits, closes or locks things.
+Aiming never swings that fast and that far back and forth, and a tap is a 20 ms twitch. Nodding several times is one Yes: nothing more counts until the case settles. Yes and No each have a **Teach…** sheet: three bursts that agree teach the axis and the speed; untaught, they use the calibrated up and right axes. A gesture that lands is confirmed in the HUD (“Yes · Return”), and the pointer goes back to where it was when the gesture began. Actions are a preset key or click, or a custom shortcut; a custom shortcut can't be the pointer shortcut, one another gesture sends, or one that quits, closes or locks things.
 
 ## 3. Surfaces
 
@@ -50,7 +50,7 @@ Aiming is one sweep, or a sweep with a small correction, and a tap is a 20 ms tw
 | Main window ("Remote") | Two pages, **Pointer** and **Settings**, and no section tabs: the toolbar is only the gear. Settings opens with a "‹ Pointer" back button; esc and ⌘1 also go back. Pages scroll; a notice bar sits above them. | 440 × 700, min 400 × 620, max width 560 |
 | Menu-bar popover | Live aim pad, Recenter, Pause, speed, then menu rows: Open AirPointer, Calibrate…, Disconnect (only while the closed case is connected), Settings…, Quit. | 320 wide |
 | Control HUD | A small non-activating capsule: "Pointing", "Paused — reason", "Disconnected — connect again, then open the lid", "Pointer stopped — allow AirPointer in Accessibility". | 40 tall, ≤ 480 wide |
-| Sheets | Attached to the main window, for a task that starts there. **Teach Yes / Teach No** (Settings ▸ Gestures ▸ Teach…): the movement in one line, three dots that fill as the person flicks, a note (flick faster, flick the same way each time), and one primary: Listening… (disabled), then Done, or Try Again after a mixed or doubled-up movement. The pointer pauses while it's open. | 420 × 290 |
+| Sheets | Attached to the main window, for a task that starts there. **Teach Yes / Teach No** (Settings ▸ Gestures ▸ Teach…): the movement in one line, three dots that fill as the person nods or shakes, a note (faster and bigger, the same way each time), and one primary: Listening… (disabled), then Done, or Try Again after a mixed or doubled-up movement. The pointer pauses while it's open. | 420 × 290 |
 | Developer tools | Keep audio on Mac and the tap test window. Under **File ▸ Developer** only; never linked from the main flows. The test window uses the same parts as the product: a DEVELOPER eyebrow and status chip, a 22 pt title, one primary bottom-right. | 480 × 440 |
 
 A flow should never open a second regular window to finish a task that started in the main window. Use the overlay, a sheet, or the page itself.
